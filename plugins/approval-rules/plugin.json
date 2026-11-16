@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "id": "approval-rules",
+  "version": "0.1.0",
+  "name": "Approval rules",
+  "description": "Permission requests an agent sends to Acpira for deletes, git push, config edits, merges and writes to other repos get a card (or are denied), including under Acpira's synthesized full access. It cannot stop Claude Code's native bypassPermissions or Codex full access, which send no requests",
+  "requires": ["node"],
+  "contributes": {
+    "runtime": {
+      "main": "plugin.ts",
+      "hooks": ["permission"],
+      "methods": ["status", "check"],
+      "timeout": 10
+    }
+  }
+}

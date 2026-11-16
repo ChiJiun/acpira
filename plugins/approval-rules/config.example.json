@@ -1,0 +1,20 @@
+{
+  "comment": "Copy to ~/.acpira/plugins/.data/approval-rules/config.json (another data home: <home>/plugins/.data/approval-rules/config.json)",
+  "highRisk": "ask",
+  "allowedRemotes": ["origin"],
+  "allowedRepos": ["ChiJiun/acpira"],
+  "rules": {
+    "force-push": { "action": "deny" },
+    "repo-delete": { "action": "deny" }
+  },
+  "configFiles": {
+    "add": ["deploy/**/*.yaml"],
+    "remove": ["package.json"]
+  },
+  "custom": [
+    { "id": "terraform-apply", "description": "terraform apply", "command": ["terraform", "apply"] },
+    { "id": "prod-context", "description": "動到正式環境的 kubectl", "pattern": "kubectl\\b.*--context[= ]prod", "action": "deny" },
+    { "id": "migrations", "description": "修改資料庫 migration", "paths": ["migrations/**"] }
+  ],
+  "toast": true
+}
