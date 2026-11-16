@@ -7,7 +7,9 @@ import { Shell } from './sidecarShell';
 
 // A prompt sent while a runtime plugin is in effect ends like any other turn, with the attached sidecar still up. On
 // Windows its wire loop used to run on the main thread, whose 1 MB stack the first poll of a prompt overran in debug
-// builds (docs/dev/windows-compatibility.md)
+// builds (docs/dev/windows-compatibility.md). Only a Windows debug sidecar can catch that regression; elsewhere (and
+// on release builds, whose frames are far smaller) this is a smoke test of the same path. The plugin answers
+// initialize at once, so the `initialize` limit (`plugins/runtime.rs`) is not exercised here
 
 const STATUS = `
 import { createInterface } from 'node:readline';
@@ -83,9 +85,14 @@ describe('a turn with a runtime plugin in effect', () => {
     }
 
     s.view('V', { type: 'send', sessionId: id, text: 'hello' });
-    const done = await s.hostMsg('V', 'session', ended(id, 2), 60_000).catch((e: Error) => {
+    // A sidecar that dies (the stack overflow) fails the test at once instead of after the wait
+    let over = false;
+    const died = new Promise<never>((_, reject) => s.proc.once('exit', code => {
+      if (!over) reject(new Error(`the sidecar exited with ${code}; stderr:\n${s.stderr.slice(-30).join('\n')}`));
+    }));
+    const done = await Promise.race([s.hostMsg('V', 'session', ended(id, 2), 60_000), died]).catch((e: Error) => {
       throw new Error(`sidecar exit code ${s.exitCode}: ${e.message.slice(-2000)}`);
-    });
+    }).finally(() => { over = true; });
     expect(done.session.turns.at(-1)?.role).toBe('agent');
     expect(s.exitCode).toBeNull();
   }

@@ -29,9 +29,16 @@ use crate::store::transcript_store::LogFn;
 /// The protocol a process and the engine speak; `initialize` refuses any other
 pub const PROTOCOL_VERSION: u64 = 1;
 /// Longest a process may take to answer `initialize`, `migrate` and `activate` included, unless `INIT_TIMEOUT_ENV` says
-/// otherwise. 120 s, as for agents (`acp::transport::process::INIT_TIMEOUT`): on a loaded Windows machine Node alone
-/// took 10–40 s to start through a launcher shim, in a job below normal priority, so 10 s failed plugins that were fine
-pub const INIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// otherwise. Longer on Windows: on a loaded machine Node alone took 10–40 s to start there through a launcher shim, in a
+/// job below normal priority, so 10 s failed plugins that were fine. A stop never waits this out (`stop_all` cancels a
+/// start under way), and the default stays well inside the engine's `PHASE_LIMIT` (sidecar/server.rs) all the same, so
+/// a teardown that did wait on one start would not be taken for a wedged engine
+#[cfg(windows)]
+pub const INIT_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(windows))]
+pub const INIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Why a start cut short by `stop_all` failed
+const STOPPING: &str = "the engine is stopping";
 /// Overrides `INIT_TIMEOUT`, in whole seconds (at least 1)
 pub const INIT_TIMEOUT_ENV: &str = "ACPIRA_PLUGIN_INIT_TIMEOUT";
 
@@ -301,6 +308,9 @@ pub struct Runtimes {
   present: parking_lot::RwLock<BTreeMap<String, String>>,
   /// The limit on `initialize` (`init_timeout`), read once when the engine starts
   init_timeout: Duration,
+  /// Raised by `stop_all`: a start waiting on `initialize` gives up at once and ends its process, so the engine's
+  /// teardown never waits out `init_timeout` behind a pass that holds `sync`
+  halt: tokio::sync::watch::Sender<bool>,
   log: LogFn,
 }
 
@@ -331,6 +341,7 @@ impl Runtimes {
       data_root,
       present: Default::default(),
       init_timeout,
+      halt: tokio::sync::watch::Sender::new(false),
       log,
     })
   }
@@ -339,12 +350,14 @@ impl Runtimes {
   pub fn enable(&self, host_call: Option<HostCall>) {
     *self.host_call.write() = host_call;
     self.host_coming.store(false, Ordering::Relaxed);
+    self.halt.send_replace(false);
     self.enabled.store(true, Ordering::Relaxed);
   }
 
   /// Let processes run before the session API exists; `enable` with it follows, and calls made meanwhile wait for it
   pub fn enable_before_host(&self) {
     self.host_coming.store(true, Ordering::Relaxed);
+    self.halt.send_replace(false);
     self.enabled.store(true, Ordering::Relaxed);
   }
 
@@ -656,6 +669,10 @@ impl Runtimes {
     let wanted = self.wanted.lock().clone();
     let mut stopped = vec![];
     for want in &wanted {
+      // The engine began stopping during the pass: start nothing more (`stop_all` waits for this pass)
+      if !self.enabled() {
+        break;
+      }
       let current = self.workers.read().get(&want.id).cloned();
       if current.as_ref().is_some_and(|w| w.want.hash == want.hash && !w.conn.is_closed() && w.deps == self.dependencies_of(want)) {
         continue;
@@ -672,6 +689,8 @@ impl Runtimes {
           (self.log)(&format!("plugin {}: version {} did not start, the running one stays: {e}", want.id, want.version));
           self.errors.write().insert(want.id.clone(), format!("the new version did not start, the previous one keeps running: {e}"));
         }
+        // Cut short by `stop_all`: no error to show and no restart
+        Err(_) if !self.enabled() => break,
         Err(e) => {
           (self.log)(&format!("plugin {}: the runtime did not start: {e}", want.id));
           self.errors.write().insert(want.id.clone(), format!("the runtime did not start: {e}"));
@@ -707,6 +726,8 @@ impl Runtimes {
   /// Stop every process (the engine is shutting down)
   pub async fn stop_all(&self) {
     self.enabled.store(false, Ordering::Relaxed);
+    // Before the lock: a pass holding it is waiting on a start, which this cuts short
+    self.halt.send_replace(true);
     // After a pass under way: it would otherwise put back a worker it was starting
     let _one = self.sync.lock().await;
     let workers: Vec<Arc<Worker>> = std::mem::take(&mut *self.workers.write()).into_values().collect();
@@ -722,6 +743,10 @@ impl Runtimes {
   /// `probe`: the activation check, which only proves the process starts and speaks the protocol; it is told so, and
   /// a definition then runs neither `migrate` nor `activate` (no data changes for a version not yet confirmed)
   async fn start_as(self: &Arc<Self>, want: &Want, probe: bool) -> Result<Arc<Worker>, String> {
+    let mut halt = self.halt.subscribe();
+    if *halt.borrow() {
+      return Err(STOPPING.into());
+    }
     let data = self.data_dir(&want.id);
     // A `main` module runs compiled (`build.rs`); the output is rebuilt when missing, from the frozen copy alone
     let command = match want.def.main.as_deref() {
@@ -772,7 +797,16 @@ impl Runtimes {
     if probe {
       init["probe"] = json!(true);
     }
-    let answer = match tokio::time::timeout(self.init_timeout, conn.request("initialize", init)).await {
+    let answered = tokio::select! {
+      r = tokio::time::timeout(self.init_timeout, conn.request("initialize", init)) => r,
+      // `stop_all`: the process goes with the start (stdin closed, then killed after the grace with its tree)
+      () = async { let _ = halt.wait_for(|h| *h).await; } => {
+        conn.close();
+        proc.stop().await;
+        return Err(STOPPING.into());
+      }
+    };
+    let answer = match answered {
       Ok(Ok(v)) => v,
       Ok(Err(e)) => {
         conn.close();
@@ -1610,5 +1644,69 @@ mod init_timeout_tests {
     for v in [None, Some(""), Some("0"), Some("-5"), Some("1.5"), Some("30s"), Some("soon")] {
       assert_eq!(init_timeout_override(v), None, "{v:?}");
     }
+  }
+
+  // Never answers initialize, keeps running with its stdin closed, and leaves its pid behind
+  const HANG: &str = "require('fs').writeFileSync(process.argv[1], String(process.pid)); process.stdin.resume(); process.stdin.on('end', () => {}); setInterval(() => {}, 1000);";
+
+  fn alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+      // SAFETY: signal 0 only checks that the pid exists
+      unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+      crate::platform::windows_process::process_info(pid).is_some()
+    }
+  }
+
+  // The engine's teardown (`HostRuntime::dispose`) waits for `stop_all`, which waits for the pass under way: a plugin
+  // stuck before answering initialize must not hold it for the whole limit, start again later, or outlive the engine
+  #[tokio::test(flavor = "multi_thread")]
+  async fn stopping_cuts_short_a_start_stuck_in_initialize_and_ends_its_process() {
+    if !crate::plugins::host::on_path("node") {
+      return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("hang");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pid_file = root.path().join("hang.pid");
+    let json = serde_json::json!({ "schema": 1, "id": "hang", "version": "1.0.0", "description": "d",
+      "contributes": { "runtime": { "command": ["node", "-e", HANG, pid_file.to_string_lossy()] } } });
+    let (m, _) = crate::plugins::manifest::parse(json.to_string().as_bytes()).unwrap();
+    let active = Arc::new(Active { id: "hang".into(), hash: "h".into(), dir, manifest: m });
+    let limit = Duration::from_secs(60);
+    let rt = Runtimes::with_init_timeout(root.path().join(".data"), Arc::new(|_: &str| {}), limit);
+    rt.enable(None);
+    let syncing = {
+      let rt = rt.clone();
+      tokio::spawn(async move { rt.sync(&[active]).await })
+    };
+    let t = Instant::now();
+    let pid = loop {
+      if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+        break pid;
+      }
+      assert!(t.elapsed() < Duration::from_secs(50), "the plugin's process never started");
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(!syncing.is_finished());
+    let t = Instant::now();
+    rt.stop_all().await;
+    // The grace for the process to exit is 2 s; nowhere near the 60 s limit
+    assert!(t.elapsed() < Duration::from_secs(10), "stop_all took {:?}", t.elapsed());
+    tokio::time::timeout(Duration::from_secs(5), syncing).await.expect("the pass ended").unwrap();
+    assert!(rt.running().is_empty());
+    assert!(rt.restarts.lock().is_empty(), "a stopped engine schedules no restart");
+    assert_eq!(rt.error("hang"), None);
+    let t = Instant::now();
+    while alive(pid) {
+      assert!(t.elapsed() < Duration::from_secs(5), "the plugin's process {pid} outlived the stop");
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Nothing starts once stopped, not even a pass that was queued
+    rt.apply().await;
+    assert!(rt.running().is_empty());
   }
 }

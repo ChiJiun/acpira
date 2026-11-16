@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - On Windows, lifting the agent CPU cap when it had never been set no longer logs a misleading "CPU limit unchanged (os error 87)".
 - On Windows, a debug build of the attached sidecar no longer ends with a stack overflow on the first prompt: the engine's command line runs on a thread with an 8 MB stack, as the main thread has on Linux and macOS, instead of the 1 MB a Windows main thread reserves.
-- A plugin's process now has 120 s instead of 10 s to answer `initialize`, so plugins no longer fail to start on a busy Windows machine where Node alone takes tens of seconds to start; `ACPIRA_PLUGIN_INIT_TIMEOUT` (seconds) sets another limit.
+- On Windows, a plugin's process now has 60 s instead of 10 s to answer `initialize`, so plugins no longer fail to start on a busy machine where Node alone takes tens of seconds to start; `ACPIRA_PLUGIN_INIT_TIMEOUT` (seconds) sets another limit on any platform.
+- Closing the engine no longer waits for a plugin stuck before answering `initialize`: its start is cut short and its process ended.
 
 ### Planned
 
