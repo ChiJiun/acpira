@@ -286,8 +286,10 @@
   .inbox-badge {
     position: absolute; top: 2px; right: 1px;
     min-width: var(--icon); height: var(--icon); padding-inline: 3px; border-radius: 999px;
-    font-size: 10px; font-weight: 600; line-height: var(--icon); text-align: center; font-variant-numeric: tabular-nums;
-    color: var(--bg-0); background: var(--fg-strong); box-shadow: 0 0 0 1.5px var(--canvas, var(--bg-0));
+    /* Three steps under the UI size (10px at the default 13px), so it follows the font size setting */
+    font-size: calc(var(--ui-font-size) - 3px); font-weight: 600; line-height: var(--icon); text-align: center; font-variant-numeric: tabular-nums;
+    /* --bg-1, the lightest ground in the light theme: the amber pill keeps 4.5:1 there (#9a6700 on #fff is 4.9:1) */
+    color: var(--bg-1); background: var(--fg-strong); box-shadow: 0 0 0 1.5px var(--canvas, var(--bg-0));
     pointer-events: none;
   }
   [data-inbox="urgent"] .inbox-badge { background: var(--warn); }

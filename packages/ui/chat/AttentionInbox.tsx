@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { memo, useMemo } from 'react';
 import { Bell, BellRing, Inbox as InboxIcon } from 'lucide-react';
 import type { SessionCategories, SessionSummary } from '@acpira/shared/transcript';
 import { dateFormat, getLocale, t, useLocale } from '../i18n';
@@ -66,7 +66,8 @@ const SECTIONS: { key: InboxSection; label: 'session.inbox.reply' | 'session.inb
   { key: 'running', label: 'session.inbox.running' },
 ];
 
-export function AttentionInbox({ sessions, activeId, categories, chats, onSelect }: {
+// Memoised: the shell renders on every streamed chunk, while the inbox only changes with the session list
+export const AttentionInbox = memo(function AttentionInbox({ sessions, activeId, categories, chats, onSelect }: {
   sessions: SessionSummary[];
   // The session on screen: it needs no review
   activeId?: string;
@@ -94,7 +95,7 @@ export function AttentionInbox({ sessions, activeId, categories, chats, onSelect
       </DropdownMenu.Popup></DropdownMenu.Positioner></DropdownMenu.Portal>
     </DropdownMenu.Root>
   );
-}
+});
 
 function InboxBody({ inbox, categories, chats, onSelect }: { inbox: Inbox; categories?: SessionCategories; chats?: string; onSelect: (id: string) => void }) {
   const shown = SECTIONS.filter(x => inbox[x.key].length > 0);

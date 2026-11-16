@@ -127,6 +127,7 @@ export const zhCN = {
   'session.switcher.placeholder': '按标题或项目切换会话…',
   'session.switcher.searchContent': '在对话内容中搜索「{query}」',
   'session.switcher.recent': '最近使用',
+  'session.switcher.more': '还有 {n} 个未显示，继续输入以缩小范围',
   'session.fallbackTitle': '会话',
   'session.deleted': '已删除「{title}」',
   'session.archived': '已归档「{title}」',

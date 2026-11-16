@@ -41,7 +41,8 @@ export function SessionSwitcher({ sessions, activeId, recent, agents, categories
   onSelect: (id: string) => void;
   // Present where the session column can search messages: the query goes there
   onSearchContent?: (query: string) => void;
-  onClose: () => void;
+  // `picked`: closed by going somewhere (a session, the message search), so the focus is that place's; else it goes back
+  onClose: (picked?: boolean) => void;
 }) {
   useLocale();
   const [query, setQuery] = useState('');
@@ -65,9 +66,10 @@ export function SessionSwitcher({ sessions, activeId, recent, agents, categories
   // Matching stays in step with the field (Enter picks what is shown); only the rendered rows are capped, the scoring
   // itself is cheap even over a long session list
   const typed = query.trim();
-  const hits = useMemo(() => {
+  const { hits, more } = useMemo(() => {
     const ordered = base.flatMap(e => { const s = latest.get(e.session.id); return s && !s.archived ? [s] : []; });
-    return matchSessions(ordered, typed, project).slice(0, MAX_ROWS);
+    const all = matchSessions(ordered, typed, project);
+    return { hits: all.slice(0, MAX_ROWS), more: Math.max(0, all.length - MAX_ROWS) };
   }, [base, latest, typed, project]);
   const groupOf = useMemo(() => new Map(base.map(e => [e.session.id, e.group])), [base]);
   const searchRow = !!onSearchContent && !!typed;
@@ -88,8 +90,8 @@ export function SessionSwitcher({ sessions, activeId, recent, agents, categories
   }, [at, hits]);
 
   const pick = (i: number) => {
-    if (i < hits.length) { onClose(); onSelect(hits[i]!.session.id); return; }
-    if (searchRow) { onClose(); onSearchContent!(typed); }
+    if (i < hits.length) { onClose(true); onSelect(hits[i]!.session.id); return; }
+    if (searchRow) { onClose(true); onSearchContent!(typed); }
   };
   const move = (delta: number) => { if (total) setActive((at + delta + total) % total); };
   const nameOf = (id: string) => agents.find(a => a.id === id)?.name ?? id;
@@ -179,6 +181,9 @@ export function SessionSwitcher({ sessions, activeId, recent, agents, categories
                   </Fragment>
                 );
               })}
+              {more > 0 && (
+                <div data-switcher-more className="flex min-h-row shrink-0 items-center px-2 text-3 text-fg-3">{t('session.switcher.more', { n: more })}</div>
+              )}
               {typed && hits.length === 0 && (
                 <div className="flex min-h-row shrink-0 items-center px-2 text-3 text-fg-3">{t('session.noMatch')}</div>
               )}

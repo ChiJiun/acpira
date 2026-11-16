@@ -1,6 +1,8 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { SessionSummary } from '@acpira/shared/transcript';
-import { buildInbox, fuzzyMatch, highlightRuns, inboxCount, inboxSection, inboxStatus, listedSessions, matchSessions, readRecent, switcherOrder, touchRecent } from '../chat/attention';
+import { buildInbox, fuzzyMatch, highlightRuns, inboxCount, inboxSection, inboxStatus, listedSessions, matchSessions, readRecent, seedSearch, switcherOrder, takeSeed, touchRecent } from '../chat/attention';
 
 const at = (m: number) => new Date(Date.UTC(2026, 10, 17, 12, 0) - m * 60_000).toISOString();
 const s = (id: string, extra: Partial<SessionSummary> = {}): SessionSummary => ({ id, title: id, agent: 'claude', cwd: '/work/a', updatedAt: at(10), ...extra });
@@ -143,6 +145,24 @@ describe('fuzzy matching', () => {
     expect(fuzzyMatch('İst', 'İstanbul')?.at).toEqual([0, 1, 2]);
     expect(fuzzyMatch('sb', 'İstanbul')?.at).toEqual([1, 5]);
   });
+  it('matches an accent typed composed or decomposed, either way round', () => {
+    const nfd = 'école'.normalize('NFD');
+    expect(fuzzyMatch('éc', nfd)?.at).toEqual([0, 1]);
+    expect(fuzzyMatch('éc'.normalize('NFD'), 'école')?.at).toEqual([0, 1]);
+    expect(highlightRuns(nfd, [0])).toEqual(['', 'é'.normalize('NFD'), 'cole']);
+    // Not folded to the bare letter: an accent the reader typed is meant
+    expect(fuzzyMatch('ecole', 'école')).toBeUndefined();
+  });
+  it('keeps an emoji joined with ZWJ whole', () => {
+    const dev = '\u{1F469}‍\u{1F4BB} dev';
+    expect(fuzzyMatch('\u{1F469}', dev)).toBeUndefined();
+    expect(fuzzyMatch('dev', dev)?.at).toEqual([2, 3, 4]);
+    expect(highlightRuns(dev, [0])).toEqual(['', '\u{1F469}‍\u{1F4BB}', ' dev']);
+  });
+  it('puts a substring at the start of a word before an earlier one inside a word', () => {
+    expect(fuzzyMatch('box', 'inbox boxes')?.at).toEqual([6, 7, 8]);
+    expect(fuzzyMatch('box', 'inbox')?.at).toEqual([2, 3, 4]);
+  });
   it('splits text into highlight runs', () => {
     expect(highlightRuns('inbox', [0, 1])).toEqual(['', 'in', 'box']);
     expect(highlightRuns('inbox', [2])).toEqual(['in', 'b', 'ox']);
@@ -169,5 +189,30 @@ describe('matching sessions', () => {
     expect(hits[0]!.title).toEqual([0, 1, 2, 3, 4]);
     expect(hits[1]!.project).toEqual([0, 1, 2, 3, 4]);
     expect(ids(matchSessions(list, '', project).map(h => h.session))).toEqual(['1', '2', '3']);
+  });
+});
+
+describe('search seed', () => {
+  it('puts a query with a new seq each time, and drops it once the column took that seq', () => {
+    const a = seedSearch(undefined, 'readme');
+    const b = seedSearch(a, 'readme');
+    expect(a).toEqual({ query: 'readme', seq: 1 });
+    expect(b.seq).toBe(2);
+    expect(takeSeed(b, 2)).toBeUndefined();
+    // A seed put after the one taken stays for the column to take
+    expect(takeSeed(b, 1)).toBe(b);
+    expect(takeSeed(undefined, 1)).toBeUndefined();
+  });
+  // The shell owns the seed and the column takes it: without the handler wired, the seed would stay and a session column
+  // mounted again later (the list moved back from hidden) would put the old query once more. No DOM in this suite, so
+  // the wiring is checked in the source
+  it('is handed to the session column together with the handler that drops it', () => {
+    const shell = readFileSync(join(import.meta.dirname, '../chat/Shell.tsx'), 'utf8');
+    const passed = shell.match(/\bsearchSeed=\{/g)?.length ?? 0;
+    expect(passed).toBeGreaterThan(0);
+    expect(shell.match(/\bonSeedTaken=\{seedTaken\}/g)?.length ?? 0).toBe(passed);
+    expect(shell).toMatch(/const seedTaken = useCallback\(\(seq: number\) => setSearchSeed\(cur => takeSeed\(cur, seq\)\), \[\]\)/);
+    const list = readFileSync(join(import.meta.dirname, '../chat/SessionList.tsx'), 'utf8');
+    expect(list).toMatch(/onSeedTaken\?\.\(searchSeed\.seq\)/);
   });
 });

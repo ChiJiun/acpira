@@ -124,6 +124,7 @@ export const ja = {
   'session.switcher.placeholder': 'タイトルやプロジェクトでセッションを切り替え…',
   'session.switcher.searchContent': '「{query}」をメッセージから検索',
   'session.switcher.recent': '最近使用',
+  'session.switcher.more': 'ほか {n} 件は非表示です。入力して絞り込んでください',
   'session.fallbackTitle': 'セッション',
   'session.deleted': '「{title}」を削除しました',
   'session.archived': '「{title}」をアーカイブしました',

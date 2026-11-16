@@ -117,6 +117,7 @@
   "session.switcher.placeholder": "제목이나 프로젝트로 세션 전환…",
   "session.switcher.searchContent": "메시지에서 “{query}” 검색",
   "session.switcher.recent": "최근 사용",
+  "session.switcher.more": "표시되지 않은 항목 {n}개. 입력해서 범위를 좁히세요",
   "session.fallbackTitle": "세션",
   "session.deleted": "“{title}” 삭제됨",
   "session.archived": "“{title}” 보관됨",

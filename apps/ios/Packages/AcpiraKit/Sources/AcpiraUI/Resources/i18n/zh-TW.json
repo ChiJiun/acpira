@@ -119,6 +119,7 @@
   "session.switcher.placeholder": "依標題或專案切換工作階段…",
   "session.switcher.searchContent": "在對話內容中搜尋「{query}」",
   "session.switcher.recent": "最近使用",
+  "session.switcher.more": "還有 {n} 個未顯示，繼續輸入以縮小範圍",
   "session.fallbackTitle": "工作階段",
   "session.deleted": "已刪除「{title}」",
   "session.archived": "已封存「{title}」",

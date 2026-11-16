@@ -115,29 +115,35 @@ export function switcherOrder(sessions: readonly SessionSummary[], activeId: str
 
 // A fuzzy match of `query` in `text`, ignoring case: every character of the query in order, not necessarily side by side.
 // The score favours runs of consecutive characters, characters at the start of a word and an early first match;
-// `at` lists the matched character indices of `text` (for highlighting). Undefined: no match
+// `at` lists the matched character indices of `text` (for highlighting, `highlightRuns`). Undefined: no match.
+// A character here is a grapheme (what reads as one: an accented letter typed decomposed, as macOS folder names come,
+// or an emoji joined with ZWJ), compared in NFC so either spelling of an accent matches the other
 export interface Fuzzy { score: number; at: number[] }
 const WORD_BREAK = /[\s\-_/\\.:,()[\]{}「」『』（）、，。·]/;
-// One character's case fold, kept to one character: a few lower to several ('İ' to 'i' and a combining dot), which would
-// shift every index after them
-const fold = (c: string) => [...c.toLowerCase()][0] ?? c;
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+export const characters = (text: string): string[] => Array.from(graphemes.segment(text), x => x.segment);
+// One character's case fold. A few capitals lower to more (`İ` to `i` and a combining dot): the extra marks go, so `i`
+// still finds it
+function fold(c: string): string {
+  const n = [...c.normalize('NFC')];
+  const lower = [...n.join('').toLowerCase()];
+  return (lower.length > n.length ? lower.slice(0, n.length) : lower).join('');
+}
 export function fuzzyMatch(query: string, text: string): Fuzzy | undefined {
-  const q = [...query].map(fold);
-  const chars = [...text];
+  const q = characters(query).map(fold);
+  const chars = characters(text);
   const lower = chars.map(fold);
   if (!q.length) return { score: 0, at: [] };
-  // A plain substring scores best: try it first so "inbox" in "Attention inbox" lands on the word, not on scattered letters
-  const joined = lower.join('');
-  const needle = q.join('');
-  const direct = joined.indexOf(needle);
-  if (direct >= 0) {
-    // Map the string index back to a character index (astral characters take two code units)
-    let ci = 0, unit = 0;
-    while (unit < direct) unit += lower[ci++]!.length;
-    const at = Array.from({ length: q.length }, (_, i) => ci + i);
-    const start = ci === 0 || WORD_BREAK.test(chars[ci - 1]!);
-    return { score: 100 + q.length * 10 + (start ? 30 : 0) - Math.min(ci, 30), at };
+  const wordStart = (i: number) => i === 0 || WORD_BREAK.test(chars[i - 1]!);
+  // A plain substring scores best, and among its places one at the start of a word, then the earliest: "box" in
+  // "inbox boxes" lands on "boxes"
+  let best: Fuzzy | undefined;
+  for (let i = 0; i + q.length <= lower.length; i++) {
+    if (!q.every((c, k) => lower[i + k] === c)) continue;
+    const score = 100 + q.length * 10 + (wordStart(i) ? 30 : 0) - Math.min(i, 30);
+    if (!best || score > best.score) best = { score, at: Array.from({ length: q.length }, (_, k) => i + k) };
   }
+  if (best) return best;
   const at: number[] = [];
   let score = 0;
   let qi = 0;
@@ -146,7 +152,7 @@ export function fuzzyMatch(query: string, text: string): Fuzzy | undefined {
     const prev = at[at.length - 1];
     score += 1;
     if (prev !== undefined && prev === i - 1) score += 5;
-    if (i === 0 || WORD_BREAK.test(chars[i - 1]!)) score += 8;
+    if (wordStart(i)) score += 8;
     at.push(i);
     qi++;
   }
@@ -188,14 +194,14 @@ export function matchSessions(ordered: readonly SessionSummary[], query: string,
   return hits.map((h, i) => ({ h, i })).sort((a, b) => b.h.score - a.h.score || a.i - b.i).map(x => x.h);
 }
 
-// Splits `text` into runs for highlighting: odd entries are matched characters
+// Splits `text` into runs for highlighting: odd entries are matched characters (graphemes, as `fuzzyMatch` counts them)
 export function highlightRuns(text: string, at: readonly number[]): string[] {
   if (!at.length) return [text];
   const marked = new Set(at);
   const runs: string[] = [];
   let cur = '';
   let on = false;
-  for (const [i, c] of [...text].entries()) {
+  for (const [i, c] of characters(text).entries()) {
     const m = marked.has(i);
     if (m !== on) { runs.push(cur); cur = ''; on = m; }
     cur += c;
@@ -203,3 +209,10 @@ export function highlightRuns(text: string, at: readonly number[]): string[] {
   runs.push(cur);
   return runs;
 }
+
+// The switcher's "search messages" row hands its query to the session column (SessionList searchSeed): a new seq puts it
+// again. The column reports the seq it put and the owner drops that seed, so a list mounted later (the column moved back
+// from hidden) starts empty rather than with a stale query
+export interface SearchSeed { query: string; seq: number }
+export const seedSearch = (cur: SearchSeed | undefined, query: string): SearchSeed => ({ query, seq: (cur?.seq ?? 0) + 1 });
+export const takeSeed = (cur: SearchSeed | undefined, seq: number): SearchSeed | undefined => (cur?.seq === seq ? undefined : cur);
