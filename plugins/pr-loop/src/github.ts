@@ -10,10 +10,10 @@ export interface RunResult {
 
 export type Runner = (args: string[], opts?: { cwd?: string }) => Promise<RunResult>;
 
-// Flags no call of this plugin may carry, whatever builds the argv
-export const FORBIDDEN_FLAGS = ['--auto', '--squash', '-s', '--rebase', '-r', '--delete-branch', '-d', '--admin', '--force', '-f', '--disable-auto'];
-
-const ALLOWED: string[][] = [['auth', 'status'], ['pr', 'view'], ['pr', 'checks'], ['pr', 'merge']];
+// The only argv shapes this plugin runs, position by position: anything else (another subcommand, an extra flag such as
+// `--auto`, `--squash`, `--rebase`, `--delete-branch`, `--admin`, `--watch`, `--web`, `--body`, combined short flags) is
+// refused before gh starts
+export const FORBIDDEN_FLAGS = ['--auto', '--squash', '-s', '--rebase', '-r', '--delete-branch', '-d', '-sd', '-rd', '--admin', '--force', '-f', '--disable-auto', '--watch', '--web', '-w', '--body', '-b'];
 
 export class GhError extends Error {
   constructor(message: string, readonly args: string[], readonly result?: RunResult) {
@@ -21,15 +21,24 @@ export class GhError extends Error {
   }
 }
 
+const REPO_ARG = /^(?:[\w.-]+\/)?[\w.-]+\/[\w.-]+$/;
+const NUMBER_ARG = /^\d+$/;
+const PR_REF = (a: string) => NUMBER_ARG.test(a) || parsePrUrl(a) !== null;
+const SHA_ARG = /^[0-9a-f]{7,64}$/i;
+const FIELDS_ARG = /^[a-zA-Z]+(,[a-zA-Z]+)*$/;
+
+type Slot = string | ((a: string) => boolean);
+const SHAPES: Slot[][] = [
+  ['auth', 'status'],
+  ['pr', 'view', PR_REF, '--json', a => FIELDS_ARG.test(a)],
+  ['pr', 'view', PR_REF, '--repo', a => REPO_ARG.test(a), '--json', a => FIELDS_ARG.test(a)],
+  ['pr', 'checks', a => NUMBER_ARG.test(a), '--repo', a => REPO_ARG.test(a), '--json', a => FIELDS_ARG.test(a)],
+  ['pr', 'merge', a => NUMBER_ARG.test(a), '--repo', a => REPO_ARG.test(a), '--merge', '--match-head-commit', a => SHA_ARG.test(a)],
+];
+
 export function guardArgs(args: string[]): void {
-  if (!ALLOWED.some(a => a.every((part, i) => args[i] === part))) {
-    throw new GhError(`pr-loop does not run \`gh ${args.slice(0, 2).join(' ')}\``, args);
-  }
-  const bad = args.filter(a => FORBIDDEN_FLAGS.includes(a.split('=')[0]!));
-  if (bad.length) throw new GhError(`pr-loop never passes ${bad.join(', ')} to gh`, args);
-  if (args[0] === 'pr' && args[1] === 'merge' && !args.includes('--merge')) {
-    throw new GhError('a merge always uses --merge (a merge commit)', args);
-  }
+  const fits = (shape: Slot[]) => shape.length === args.length && shape.every((slot, i) => (typeof slot === 'string' ? args[i] === slot : slot(args[i]!)));
+  if (!SHAPES.some(fits)) throw new GhError(`pr-loop does not run \`gh ${args.join(' ')}\` (only its fixed read calls and one plain merge-commit merge)`, args);
 }
 
 export interface PullRequest {
@@ -49,10 +58,13 @@ export interface PullRequest {
 
 export type CiState = { state: 'none' } | { state: 'pending'; pending: string[] } | { state: 'pass' } | { state: 'fail'; failed: { name: string; workflow: string; link: string; description: string }[] };
 
-// `https://github.com/<owner>/<repo>/pull/<n>` → its parts; null for anything else
+// `https://<host>/<owner>/<repo>/pull/<n>` → `owner/repo` on github.com, `host/owner/repo` elsewhere (the form gh's
+// `--repo` takes), so the allow list and the loop keys tell hosts apart; null for anything else
 export function parsePrUrl(url: string): { repo: string; number: number } | null {
-  const m = /^https?:\/\/[^/\s]+\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)(?:[/?#].*)?$/i.exec(url.trim());
-  return m ? { repo: `${m[1]}/${m[2]}`, number: Number(m[3]) } : null;
+  const m = /^https:\/\/([^/\s]+)\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)(?:[/?#].*)?$/i.exec(url.trim());
+  if (!m) return null;
+  const host = m[1]!.toLowerCase();
+  return { repo: `${host === 'github.com' ? '' : `${host}/`}${m[2]}/${m[3]}`, number: Number(m[4]) };
 }
 
 const PR_FIELDS = 'number,url,state,isDraft,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeCommit';

@@ -4,7 +4,10 @@
 //
 // Persistence: one `state` key holds every loop, written compare-and-swap. A step that starts something that must not
 // happen twice (a reviewer session, the merge) saves a transient phase (`launching`, `merging`) first; finding one of
-// those outside a running step means the engine stopped mid-step, so the loop stops and says where instead of redoing it
+// those outside a running step means the engine stopped mid-step, so the loop stops and says where instead of redoing it.
+//
+// The merge invariant: `gh pr merge` runs only while the newest round's verdict is `mergeable` for exactly the PR's
+// current head (`passed`). Nothing else (a phase, a resume, a stored sha) stands in for it
 
 import { GhError, type GitHub, type PullRequest } from './github';
 import {
@@ -17,6 +20,7 @@ import {
   repeatedKeys,
   REQUIREMENT_TITLES,
   section,
+  verdictBegin,
   type PrTarget,
   type SameIssue,
 } from './review';
@@ -46,7 +50,8 @@ export interface Host {
   // A new session of `agent` in `cwd`; its id, or null when none was made
   newSession(agent: string, cwd: string): Promise<string | null>;
   // A prompt into a session, as the user would send it. Resolves once it went out (or, on some engines, later): the
-  // machine never waits on it inside a step
+  // machine never waits on it inside a step. The engine drops a prompt to a session it does not have open, so the
+  // machine checks the session is open first
   send(session: string, text: string): Promise<void>;
   // A card in `session` with one choice; the option's id, or null when it timed out
   ask(session: string, message: string, options: AskOption[], waitSecs: number): Promise<string | null>;
@@ -62,7 +67,7 @@ export interface Store {
 }
 
 export interface Config {
-  // `owner/repo` the loop may run on and merge into; empty means nowhere
+  // `owner/repo` (github.com) or `host/owner/repo` the loop may run on and merge into; empty means nowhere
   allowedRepos: string[];
   // The reviewer's agent id; empty: the implementing session's agent
   reviewerAgent: string;
@@ -79,11 +84,16 @@ export const DEFAULT_CONFIG: Config = { allowedRepos: [], reviewerAgent: '', mer
 export const MAX_ROUNDS = 5;
 // A reviewer that has not started its turn this long after the brief went out failed to start
 export const START_GRACE_MS = 3 * 60_000;
-// A loop whose owner wrote nothing this many polls ago is taken over by another engine
+// "No checks" right after a push may be checks not registered yet: it has to hold this long before it counts as no CI
+export const NO_CI_GRACE_MS = 2 * 60_000;
+// A loop whose owner wrote nothing this many polls ago (and at least STALE_MIN_MS, longer than one gh call may take) is
+// taken over by another engine
 const STALE_POLLS = 3;
+const STALE_MIN_MS = 5 * 60_000;
 const LOG_MAX = 40;
 const KEEP_FINISHED = 20;
 const ASK_WAIT_SECS = 25 * 60;
+const CONFIRM_WAIT_SECS = 5 * 60;
 
 export type Phase = 'launching' | 'reviewing' | 'waitingFix' | 'waitingCi' | 'confirmMerge' | 'merging' | 'merged' | 'stopped' | 'cancelled';
 
@@ -96,6 +106,7 @@ export type StopReason =
   | 'pr-closed'
   | 'pr-merged-elsewhere'
   | 'impl-gone'
+  | 'impl-closed'
   | 'reviewer-gone'
   | 'reviewer-failed'
   | 'interrupted'
@@ -115,6 +126,8 @@ export interface Round {
   reviewer: string;
   at: number;
   result: 'mergeable' | 'not_mergeable' | 'unparseable' | 'conflict';
+  // What a `conflict` round's reviewer judged; the user accepting it on resume turns the round into that result
+  verdict?: 'mergeable' | 'not_mergeable';
   keys: string[];
   blocking: number;
 }
@@ -146,10 +159,14 @@ export interface Loop {
   roundLimit: number;
   reviewedSha: string;
   baseSha: string;
-  reviewer: { session: string; agent: string; sentAt: number } | null;
+  reviewer: { session: string; agent: string; sentAt: number; nonce: string } | null;
   rounds: Round[];
   pendingFix: string | null;
+  // The fix list (`pendingFix`) is decided but not yet handed to the implementing session
+  fixPending: boolean;
   lastCiFail: string[] | null;
+  // When "no checks" was first seen for the current head
+  noCiSince: { sha: string; at: number } | null;
   stop: Stop | null;
   merge: { commit: string | null; at: number } | null;
   owner: string;
@@ -188,6 +205,7 @@ const REASON_TEXT: Record<StopReason, string> = {
   'pr-closed': 'PR 已被關閉',
   'pr-merged-elsewhere': 'PR 已被別人合併',
   'impl-gone': '實作 session 不見了',
+  'impl-closed': '實作 session 沒有在這個引擎開著',
   'reviewer-gone': 'reviewer session 不見了',
   'reviewer-failed': 'reviewer session 沒有開始或沒有回覆',
   interrupted: '引擎在這一步中途停止',
@@ -201,22 +219,28 @@ const REASON_TEXT: Record<StopReason, string> = {
 const RESUME_TEXT: Record<Resume, string> = {
   review: '開一個新的 reviewer 重新 review 目前的 head',
   fix: '把修正清單送回實作 session，修完後再 review',
-  ci: '重新檢查 CI 與合併條件',
+  ci: '重新檢查 review 結論、CI 與合併條件',
   retry: '重試卡住的那一步',
 };
 
 export const keyOf = (repo: string, number: number) => `${repo.toLowerCase()}#${number}`;
 const short = (sha: string) => sha.slice(0, 8);
+const sameRepo = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
-// Text of the agent's turns after the last user turn, and whether the session has such a turn yet
-export function lastReply(view: SessionView): { asked: boolean; replied: boolean; text: string; error: string } {
+// The reply to the prompt carrying `nonce`: the agent turns after that user turn, up to the next user turn (a later
+// prompt from another plugin or a gate is not the reviewer's verdict)
+export function lastReply(view: SessionView, nonce: string): { asked: boolean; replied: boolean; text: string; error: string } {
   const turns = view.turns ?? [];
   let u = -1;
   turns.forEach((t, i) => {
-    if (t.role === 'user') u = i;
+    if (t.role === 'user' && typeof t.text === 'string' && t.text.includes(verdictBegin(nonce))) u = i;
   });
   if (u < 0) return { asked: false, replied: false, text: '', error: '' };
-  const after = turns.slice(u + 1).filter(t => t.role === 'agent');
+  const after: Record<string, unknown>[] = [];
+  for (const t of turns.slice(u + 1)) {
+    if (t.role === 'user') break;
+    if (t.role === 'agent') after.push(t);
+  }
   const text = after
     .flatMap(t => (Array.isArray(t.blocks) ? (t.blocks as Record<string, unknown>[]) : []))
     .filter(b => b.type === 'text' && typeof b.markdown === 'string')
@@ -229,6 +253,14 @@ export function lastReply(view: SessionView): { asked: boolean; replied: boolean
   return { asked: true, replied: after.length > 0, text, error };
 }
 
+// The newest round passed review for exactly `sha`: the only ground for a merge or a merge card
+export function passed(loop: Loop, sha: string): boolean {
+  const last = loop.rounds[loop.rounds.length - 1];
+  return !!last && last.round === loop.round && last.result === 'mergeable' && last.sha === sha && !!sha;
+}
+
+const randomNonce = () => Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+
 export interface Deps {
   host: Host;
   store: Store;
@@ -236,6 +268,7 @@ export interface Deps {
   now?: () => number;
   // This process's identity among engines
   owner: string;
+  nonce?: () => string;
 }
 
 export class PrLoop {
@@ -243,16 +276,19 @@ export class PrLoop {
   private readonly store: Store;
   private readonly gh: GitHub;
   private readonly now: () => number;
+  private readonly nonce: () => string;
   readonly owner: string;
   private chain: Promise<unknown> = Promise.resolve();
   // Cards open right now, by loop key: a tick never shows a second one
   private readonly asking = new Set<string>();
+  private staleMs = STALE_MIN_MS;
 
   constructor(deps: Deps) {
     this.host = deps.host;
     this.store = deps.store;
     this.gh = deps.gh;
     this.now = deps.now ?? Date.now;
+    this.nonce = deps.nonce ?? randomNonce;
     this.owner = deps.owner;
   }
 
@@ -298,24 +334,32 @@ export class PrLoop {
     throw new Error('the loop state kept changing under this engine');
   }
 
-  // Writes the loop back. A loop another engine (or a command) cancelled meanwhile stays cancelled
-  private async save(loop: Loop): Promise<void> {
+  // Writes the loop back. A loop cancelled meanwhile stays cancelled, and one another engine owns and still writes is
+  // not overwritten; `claim` (a user's command, a takeover) takes it over instead
+  private async save(loop: Loop, claim = false): Promise<void> {
     loop.updatedAt = this.now();
     loop.heartbeat = this.now();
     loop.log = loop.log.slice(-LOG_MAX);
-    let cancelled = false;
+    if (claim) loop.owner = this.owner;
+    let abort: string | null = null;
     await this.update(s => {
       const stored = s.loops[loop.key];
-      if (stored && stored.phase === 'cancelled' && loop.phase !== 'cancelled' && stored.createdAt === loop.createdAt) {
-        cancelled = true;
-        return;
+      if (stored && stored.createdAt === loop.createdAt) {
+        if (stored.phase === 'cancelled' && loop.phase !== 'cancelled') {
+          abort = 'the loop was cancelled';
+          return;
+        }
+        if (!claim && stored.owner !== loop.owner && this.now() - stored.heartbeat < this.staleMs) {
+          abort = `the loop is run by ${stored.owner}`;
+          return;
+        }
       }
       s.loops[loop.key] = loop;
       // Finished loops beyond the newest few are let go, so the store stays small
       const done = Object.values(s.loops).filter(l => !isActive(l) && l.phase !== 'stopped').sort((a, b) => b.updatedAt - a.updatedAt);
       for (const l of done.slice(KEEP_FINISHED)) delete s.loops[l.key];
     });
-    if (cancelled) throw new Cancelled();
+    if (abort) throw new Aborted(abort);
   }
 
   private note(loop: Loop, text: string): void {
@@ -354,7 +398,7 @@ export class PrLoop {
         case 'resume':
           return await this.exclusive(() => this.resumeCmd(session, tail || null));
         case 'config':
-          return await this.exclusive(() => this.configCmd(session, rest));
+          return await this.configCmd(session, rest);
         default:
           return await this.exclusive(() => this.start(session, head, tail));
       }
@@ -363,37 +407,55 @@ export class PrLoop {
     }
   }
 
+  // A setting change. One that loosens a limit (a repo allowed, the reviewer or gh program changed, merging without a
+  // card) waits for a confirmation card first: the command may come from another plugin's prompt, not a person typing
   private async configCmd(session: string, args: string[]): Promise<void> {
-    const c = await this.config();
     const [what = '', ...values] = args;
     const value = values.join(' ').trim();
-    const repoOk = (r: string) => /^[\w.-]+\/[\w.-]+$/.test(r);
+    const repoOk = (r: string) => /^(?:[\w.-]+\/)?[\w.-]+\/[\w.-]+$/.test(r);
+    let change: ((c: Config) => void) | null = null;
+    let loosens: string | null = null;
     switch (what.toLowerCase()) {
       case '':
         break;
       case 'allow':
-        if (!repoOk(value)) throw new Error('用法：/pr-loop config allow <owner>/<repo>');
-        if (!c.allowedRepos.some(r => r.toLowerCase() === value.toLowerCase())) c.allowedRepos.push(value);
+        if (!repoOk(value)) throw new Error('用法：/pr-loop config allow <owner>/<repo>（github.com 以外加上 host：<host>/<owner>/<repo>）');
+        change = c => {
+          if (!c.allowedRepos.some(r => sameRepo(r, value))) c.allowedRepos.push(value);
+        };
+        loosens = `允許在 \`${value}\` 上自動循環並合併 PR`;
         break;
       case 'disallow':
-        c.allowedRepos = c.allowedRepos.filter(r => r.toLowerCase() !== value.toLowerCase());
+        change = c => {
+          c.allowedRepos = c.allowedRepos.filter(r => !sameRepo(r, value));
+        };
         break;
       case 'reviewer':
-        c.reviewerAgent = value === 'same' ? '' : value;
+        change = c => {
+          c.reviewerAgent = value === 'same' ? '' : value;
+        };
+        loosens = `reviewer 改用 agent \`${value === 'same' ? '與實作 session 相同' : value}\``;
         break;
       case 'merge':
         if (value !== 'confirm' && value !== 'auto') throw new Error('用法：/pr-loop config merge confirm|auto');
-        c.merge = value;
+        change = c => {
+          c.merge = value;
+        };
+        if (value === 'auto') loosens = '條件都滿足時不再出確認卡片，直接合併';
         break;
       case 'poll': {
         const n = Number(value);
         if (!Number.isFinite(n) || n < 5 || n > 3600) throw new Error('用法：/pr-loop config poll <5 到 3600 秒>');
-        c.pollSecs = Math.round(n);
+        change = c => {
+          c.pollSecs = Math.round(n);
+        };
         break;
       }
       case 'same-issue':
         if (value !== 'category+file' && value !== 'category') throw new Error('用法：/pr-loop config same-issue category+file|category');
-        c.sameIssue = value;
+        change = c => {
+          c.sameIssue = value;
+        };
         break;
       case 'gh': {
         let argv: unknown;
@@ -405,39 +467,54 @@ export class PrLoop {
         if (!Array.isArray(argv) || argv.length === 0 || !argv.every(a => typeof a === 'string' && a)) {
           throw new Error('用法：/pr-loop config gh gh  或  /pr-loop config gh ["node","C:/path/fake-gh.mjs"]');
         }
-        c.gh = argv as string[];
+        change = c => {
+          c.gh = argv as string[];
+        };
+        loosens = `之後的 gh 呼叫改成執行 \`${JSON.stringify(argv)}\`（這個程式會以你的權限執行）`;
         break;
       }
       default:
         throw new Error(`不認得的設定 \`${what}\`。\n\n${HELP}`);
     }
-    if (what) await this.store.set('config', c);
-    await this.say(session, configText(c));
+    const apply = async () => {
+      const c = await this.config();
+      if (change) {
+        change(c);
+        await this.store.set('config', c);
+      }
+      await this.say(session, configText(c));
+    };
+    if (!loosens) return this.exclusive(apply);
+    const answer = await this.host
+      .ask(session, `pr-loop：要變更設定嗎？\n\n${loosens}。\n\n這會放寬 pr-loop 的限制，請確認是你自己要求的。`, [{ id: 'confirm', label: '確認變更' }, { id: 'cancel', label: '取消' }], CONFIRM_WAIT_SECS)
+      .catch(() => null);
+    if (answer !== 'confirm') return this.say(session, 'pr-loop：設定沒有變更。');
+    return this.exclusive(apply);
   }
 
   private async findLoop(session: string, ref: string | null, want: (l: Loop) => boolean): Promise<Loop | null> {
-    const all = await this.loops();
+    const all = (await this.loops()).filter(want);
     if (ref) {
-      const n = Number(ref.replace(/^#/, ''));
       const byUrl = /\/pull\/(\d+)/.exec(ref);
-      return all.find(l => l.url === ref || (byUrl && l.url.startsWith(ref.split('/pull/')[0]!) && l.number === Number(byUrl[1])) || (Number.isInteger(n) && l.number === n && want(l))) ?? null;
+      const n = Number(ref.replace(/^#/, ''));
+      return all.find(l => l.url === ref || (byUrl && l.url.startsWith(ref.split('/pull/')[0]!) && l.number === Number(byUrl[1])) || (Number.isInteger(n) && l.number === n)) ?? null;
     }
-    const mine = all.filter(l => l.implSession === session && want(l)).sort((a, b) => b.updatedAt - a.updatedAt);
+    const mine = all.filter(l => l.implSession === session).sort((a, b) => b.updatedAt - a.updatedAt);
     return mine[0] ?? null;
   }
 
   private async cancel(session: string, ref: string | null): Promise<void> {
     const loop = await this.findLoop(session, ref, l => isActive(l) || l.phase === 'stopped');
-    if (!loop) return this.say(session, 'pr-loop：這個 session 沒有進行中的循環。');
+    if (!loop) return this.say(session, 'pr-loop：沒有進行中或停下的循環可以停止。');
     loop.phase = 'cancelled';
     this.note(loop, '使用者停止了循環');
-    await this.save(loop);
+    await this.save(loop, true);
     await this.say(session, `pr-loop：已停止 ${loop.repo}#${loop.number} 的循環。已開的 reviewer session 不會被刪除；PR 不會被合併。`);
   }
 
   private async resumeCmd(session: string, ref: string | null): Promise<void> {
     const loop = await this.findLoop(session, ref, l => l.phase === 'stopped');
-    if (!loop || loop.phase !== 'stopped' || !loop.stop) return this.say(session, 'pr-loop：沒有停下等你決定的循環。');
+    if (!loop || !loop.stop) return this.say(session, 'pr-loop：沒有停下等你決定的循環。');
     await this.resume(loop);
   }
 
@@ -446,25 +523,32 @@ export class PrLoop {
     if (!stop.resume) {
       return this.say(loop.implSession, `pr-loop：${loop.repo}#${loop.number} 停在「${REASON_TEXT[stop.reason]}」，不能接續；要重來請重新執行 /pr-loop ${loop.url}`);
     }
-    this.note(loop, `使用者選擇接續：${RESUME_TEXT[stop.resume]}`);
+    const action = stop.resume;
+    this.note(loop, `使用者選擇接續：${RESUME_TEXT[action]}`);
+    // Back to the step it stopped at, so a failure while resuming records that step and the same way on
     loop.stop = null;
-    loop.owner = this.owner;
+    loop.phase = stop.step;
     // Going on after a stop is the user's call, so the round it needs is granted
-    if (stop.resume === 'review' || stop.resume === 'fix') loop.roundLimit = Math.max(loop.roundLimit, loop.round + 1);
-    switch (stop.resume) {
+    if (action === 'review' || action === 'fix') loop.roundLimit = Math.max(loop.roundLimit, loop.round + 1);
+    if (stop.reason === 'conflict') {
+      // The user accepts what the reviewer judged despite the conflicts it reported
+      const last = loop.rounds[loop.rounds.length - 1];
+      if (last?.result === 'conflict' && last.verdict) last.result = last.verdict;
+    }
+    await this.save(loop, true);
+    switch (action) {
       case 'review':
-        return this.guarded(loop, () => this.launchReview(loop));
+        return this.guarded(loop, () => this.launchReview(loop), action);
       case 'fix':
-        return this.guarded(loop, () => this.sendFix(loop));
+        loop.phase = 'waitingFix';
+        loop.fixPending = true;
+        return this.guarded(loop, () => this.sendFix(loop), action);
       case 'ci':
         loop.phase = 'waitingCi';
-        await this.save(loop);
-        return this.guarded(loop, () => this.advance(loop));
+        return this.guarded(loop, () => this.waitingCi(loop), action);
       case 'retry':
-        loop.phase = stop.step === 'launching' ? 'waitingCi' : stop.step;
-        if (stop.step === 'launching') return this.guarded(loop, () => this.launchReview(loop));
-        await this.save(loop);
-        return this.guarded(loop, () => this.advance(loop));
+        if (stop.step === 'launching') return this.guarded(loop, () => this.launchReview(loop), action);
+        return this.guarded(loop, () => this.advance(loop), action);
     }
   }
 
@@ -481,7 +565,7 @@ export class PrLoop {
     if (!m && !url) throw new Error(`\`${ref}\` 不是 PR 編號或網址。\n\n${HELP}`);
     await this.gh.authStatus();
     const pr = await this.gh.pr(url ?? m![1]!, undefined, info.cwd);
-    if (!c.allowedRepos.some(r => r.toLowerCase() === pr.repo.toLowerCase())) {
+    if (!c.allowedRepos.some(r => sameRepo(r, pr.repo))) {
       return this.say(session, `pr-loop：${pr.repo} 不在允許自動循環的 repo 清單（目前：${c.allowedRepos.join('、')}），所以不會啟動。\n\n如果這是約定的開發 repo，用 \`/pr-loop config allow ${pr.repo}\` 加入；要合併到主 repo 請自己處理。`, 'warning');
     }
     if (pr.state !== 'OPEN') return this.say(session, `pr-loop：${pr.repo}#${pr.number} 的狀態是 ${pr.state}，不會啟動。`, 'warning');
@@ -520,7 +604,7 @@ export class PrLoop {
       requirement,
       requirementSource: source,
       notes,
-      phase: 'waitingCi',
+      phase: 'launching',
       round: 0,
       roundLimit: MAX_ROUNDS,
       reviewedSha: '',
@@ -528,7 +612,9 @@ export class PrLoop {
       reviewer: null,
       rounds: [],
       pendingFix: null,
+      fixPending: false,
       lastCiFail: null,
+      noCiSince: null,
       stop: null,
       merge: null,
       owner: this.owner,
@@ -549,7 +635,7 @@ export class PrLoop {
         `- 最多 ${MAX_ROUNDS} 輪；用 \`/pr-loop status\` 查看、\`/pr-loop stop\` 停止。`,
       ].join('\n'),
     );
-    await this.guarded(loop, () => this.launchReview(loop, pr));
+    await this.guarded(loop, () => this.launchReview(loop, pr), 'review');
   }
 
   private async firstMessage(session: string): Promise<string> {
@@ -560,29 +646,30 @@ export class PrLoop {
 
   // ---- the loop ----
 
-  // Runs a step; a GitHub failure or anything thrown stops the loop with what happened, never retried in silence
-  private async guarded(loop: Loop, fn: () => Promise<void>): Promise<void> {
+  // Runs a step; a GitHub failure or anything thrown stops the loop with what happened, never retried in silence.
+  // `onError` is what resuming after such a failure does (a failure while resuming keeps the resume it came from)
+  private async guarded(loop: Loop, fn: () => Promise<void>, onError: Resume = 'retry'): Promise<void> {
     try {
       await fn();
     } catch (e) {
-      if (e instanceof Cancelled) return;
+      if (e instanceof Aborted) return;
       if (e instanceof GhError) {
-        return this.halt(loop, 'gh', `${e.message}\n\n先確認 \`gh auth status\` 已登入、網路正常。`, 'retry');
+        return this.halt(loop, 'gh', `${e.message}\n\n先確認 \`gh auth status\` 已登入、網路正常。`, onError);
       }
-      return this.halt(loop, 'error', (e as Error).stack ?? String(e), 'retry');
+      return this.halt(loop, 'error', (e as Error).stack ?? String(e), onError);
     }
   }
 
   // The loop stops for the user: where it is, what was done, and what resuming would do
   private async halt(loop: Loop, reason: StopReason, detail: string, resume: Resume | null): Promise<void> {
-    const step = loop.phase === 'stopped' ? (loop.stop?.step ?? 'waitingCi') : loop.phase;
+    const step: Phase = loop.phase === 'stopped' ? (loop.stop?.step ?? 'launching') : loop.phase;
     loop.stop = { reason, step, detail, resume, at: this.now() };
     loop.phase = 'stopped';
     this.note(loop, `停下：${REASON_TEXT[reason]}`);
     try {
       await this.save(loop);
     } catch (e) {
-      if (e instanceof Cancelled) return;
+      if (e instanceof Aborted) return;
       throw e;
     }
     const done = loop.rounds.map(r => `第 ${r.round} 輪（${short(r.sha)}）：${ROUND_TEXT[r.result]}${r.blocking ? `，${r.blocking} 個 blocking` : ''}`);
@@ -606,6 +693,7 @@ export class PrLoop {
     const options: AskOption[] = [...(resume ? [{ id: 'resume', label: '接續' }] : []), { id: 'stop', label: '停止循環' }, { id: 'later', label: '稍後決定' }];
     this.asking.add(loop.key);
     const createdAt = loop.createdAt;
+    const stopAt = loop.stop.at;
     void this.host
       .ask(loop.implSession, message, options, ASK_WAIT_SECS)
       .catch(() => null)
@@ -613,7 +701,8 @@ export class PrLoop {
         this.exclusive(async () => {
           this.asking.delete(loop.key);
           const now = await this.loop(loop.key);
-          if (!now || now.createdAt !== createdAt || now.phase !== 'stopped') return;
+          // Only for the stop this card was about
+          if (!now || now.createdAt !== createdAt || now.phase !== 'stopped' || now.stop?.at !== stopAt) return;
           if (answer === 'resume') await this.resume(now);
           else if (answer === 'stop') await this.cancel(now.implSession, now.url);
         }),
@@ -623,7 +712,7 @@ export class PrLoop {
   // Every loop this engine runs, one step each
   async tick(): Promise<void> {
     const c = await this.config();
-    const stale = Math.max(90_000, c.pollSecs * 1000 * STALE_POLLS);
+    this.staleMs = Math.max(STALE_MIN_MS, c.pollSecs * 1000 * STALE_POLLS);
     for (const l of await this.loops()) {
       if (!isActive(l)) continue;
       await this.exclusive(async () => {
@@ -632,9 +721,14 @@ export class PrLoop {
         if (loop.owner !== this.owner) {
           // Another engine runs it while it writes; this one takes over when it went quiet or holds the session
           const mine = (await this.host.session(loop.implSession, 0)) !== null;
-          if (!mine && this.now() - loop.heartbeat < stale) return;
+          if (!mine && this.now() - loop.heartbeat < this.staleMs) return;
           this.note(loop, `由這個引擎接手（前一個：${loop.owner}）`);
-          loop.owner = this.owner;
+          try {
+            await this.save(loop, true);
+          } catch (e) {
+            if (e instanceof Aborted) return;
+            throw e;
+          }
         }
         await this.guarded(loop, () => this.advance(loop));
       });
@@ -662,7 +756,6 @@ export class PrLoop {
         return this.waitingCi(loop);
       case 'confirmMerge':
         if (!this.asking.has(loop.key)) return this.waitingCi(loop);
-        loop.heartbeat = this.now();
         return this.save(loop);
       default:
         return;
@@ -714,6 +807,8 @@ export class PrLoop {
     loop.round += 1;
     loop.reviewedSha = pr.headRefOid;
     loop.reviewer = null;
+    loop.pendingFix = null;
+    loop.fixPending = false;
     loop.phase = 'launching';
     this.note(loop, `第 ${loop.round} 輪：為 ${short(pr.headRefOid)} 開 reviewer（${agent}）`);
     await this.save(loop);
@@ -722,10 +817,11 @@ export class PrLoop {
       loop.round -= 1;
       return this.halt(loop, 'reviewer-failed', `無法用 agent \`${agent}\` 開新的 reviewer session（agent 未安裝、未登入，或 id 打錯？用 \`/pr-loop config reviewer <agent id>\` 修改）。`, 'review');
     }
-    loop.reviewer = { session: id, agent, sentAt: this.now() };
+    const nonce = this.nonce();
+    loop.reviewer = { session: id, agent, sentAt: this.now(), nonce };
     loop.phase = 'reviewing';
     await this.save(loop);
-    const text = brief(this.target(loop, pr), loop.requirement, loop.notes);
+    const text = brief(this.target(loop, pr), loop.requirement, loop.notes, nonce);
     const key = loop.key;
     void this.host.send(id, text).catch(e =>
       this.exclusive(async () => {
@@ -739,28 +835,25 @@ export class PrLoop {
   private async reviewing(loop: Loop): Promise<void> {
     const r = loop.reviewer;
     if (!r) return this.halt(loop, 'interrupted', '找不到這一輪 reviewer session 的紀錄。', 'review');
-    const view = await this.host.session(r.session, 5);
+    const view = await this.host.session(r.session, 20);
     if (!view) {
       const listed = (await this.host.sessions()).some(s => s.id === r.session);
       return listed
         ? this.halt(loop, 'interrupted', `reviewer session \`${r.session}\` 沒有在這個引擎開著（多半是引擎重啟過），讀不到它的結論。不會自動再開一個 reviewer。`, 'review')
         : this.halt(loop, 'reviewer-gone', `reviewer session \`${r.session}\` 已經不在 session 清單裡。`, 'review');
     }
-    const reply = lastReply(view);
-    if (view.running) {
-      loop.heartbeat = this.now();
-      return this.save(loop);
-    }
+    const reply = lastReply(view, r.nonce);
+    if (view.running && !(reply.replied && reply.text.includes(verdictBegin(r.nonce)))) return this.save(loop);
     if (!reply.asked || !reply.replied) {
-      if (this.now() - r.sentAt < START_GRACE_MS) {
-        loop.heartbeat = this.now();
-        return this.save(loop);
-      }
+      if (this.now() - r.sentAt < START_GRACE_MS) return this.save(loop);
       return this.halt(loop, 'reviewer-failed', `reviewer session \`${r.session}\` 在 ${START_GRACE_MS / 60_000} 分鐘內沒有開始或沒有回覆。`, 'review');
     }
-    const parsed = parseVerdict(reply.text);
-    const record = (result: Round['result'], keys: string[] = [], blocking = 0) =>
-      loop.rounds.push({ round: loop.round, sha: loop.reviewedSha, reviewer: r.session, at: this.now(), result, keys, blocking });
+    // A reply still streaming may not hold its block yet
+    if (view.running) return this.save(loop);
+    const parsed = parseVerdict(reply.text, r.nonce);
+    const record = (result: Round['result'], keys: string[] = [], blocking = 0, verdict?: Round['verdict']) =>
+      loop.rounds.push({ round: loop.round, sha: loop.reviewedSha, reviewer: r.session, at: this.now(), result, keys, blocking, ...(verdict ? { verdict } : {}) });
+    // Every outcome below leaves `reviewing` in the same save as its record, so a round is never read twice
     if (!parsed.ok) {
       record('unparseable');
       return this.halt(loop, 'unparseable', `reviewer session \`${r.session}\` 的回覆讀不到固定格式的結論：${parsed.error}${reply.error ? `\n\n這一輪的錯誤：${reply.error}` : ''}`, 'review');
@@ -769,7 +862,7 @@ export class PrLoop {
     const c = await this.config();
     const keys = v.blocking.map(b => issueKey(b, c.sameIssue));
     if (v.conflicts.length) {
-      record('conflict', keys, v.blocking.length);
+      record('conflict', keys, v.blocking.length, v.mergeable ? 'mergeable' : 'not_mergeable');
       if (!v.mergeable) loop.pendingFix = fixList(this.target(loop), loop.round, v);
       return this.halt(loop, 'conflict', `reviewer 回報需要你決定的衝突：\n${v.conflicts.map(x => `- ${x}`).join('\n')}\n\n它的判斷是「${v.mergeable ? '可合併' : '不可合併'}」。接續就照這個判斷繼續。`, v.mergeable ? 'ci' : 'fix');
     }
@@ -784,7 +877,10 @@ export class PrLoop {
     const previous = [...loop.rounds].reverse().find(x => x.result === 'mergeable' || x.result === 'not_mergeable');
     record('not_mergeable', keys, v.blocking.length);
     loop.pendingFix = fixList(this.target(loop), loop.round, v);
+    loop.fixPending = true;
+    loop.phase = 'waitingFix';
     this.note(loop, `第 ${loop.round} 輪 review 判定不可合併（${v.blocking.length} 個 blocking：${keys.join(', ')}）`);
+    await this.save(loop);
     const repeated = previous?.result === 'not_mergeable' ? repeatedKeys(previous.keys, keys) : [];
     if (repeated.length) {
       return this.halt(loop, 'repeated', `第 ${previous!.round} 輪與第 ${loop.round} 輪都退回同一類問題：${repeated.join('、')}（類別${c.sameIssue === 'category' ? '' : '＋檔案'}相同）。方向可能錯了，請先看過再決定。\n\n這一輪的修正清單：\n\n${loop.pendingFix}`, 'fix');
@@ -795,13 +891,19 @@ export class PrLoop {
     return this.sendFix(loop);
   }
 
+  // Hands the decided fix list to the implementing session, once
   private async sendFix(loop: Loop): Promise<void> {
     const pr = await this.openPr(loop);
     if (!pr) return;
     if (!(await this.implAlive(loop))) return;
     const text = loop.pendingFix;
     if (!text) return this.halt(loop, 'error', '沒有可送出的修正清單。', 'review');
+    // The engine drops a prompt to a session it does not have open, without an error
+    if ((await this.host.session(loop.implSession, 0)) === null) {
+      return this.halt(loop, 'impl-closed', `實作 session \`${loop.implSession}\` 沒有在這個引擎開著，修正清單送不進去。打開那個 session 後接續。`, 'fix');
+    }
     loop.baseSha = pr.headRefOid;
+    loop.fixPending = false;
     loop.phase = 'waitingFix';
     this.note(loop, `修正清單送回實作 session，等 ${short(pr.headRefOid)} 之後的新 commit`);
     await this.save(loop);
@@ -809,21 +911,18 @@ export class PrLoop {
     void this.host.send(loop.implSession, text).catch(e =>
       this.exclusive(async () => {
         const now = await this.loop(key);
-        if (now && now.phase === 'waitingFix') await this.halt(now, 'impl-gone', `修正清單沒有送進實作 session：${(e as Error).message}`, 'fix');
+        if (now && now.phase === 'waitingFix') await this.halt(now, 'impl-closed', `修正清單沒有送進實作 session：${(e as Error).message}`, 'fix');
       }),
     );
   }
 
   private async waitingFix(loop: Loop): Promise<void> {
+    if (loop.fixPending) return this.sendFix(loop);
     const pr = await this.openPr(loop);
     if (!pr) return;
     if (!(await this.implAlive(loop))) return;
-    if (pr.headRefOid === loop.baseSha) {
-      loop.heartbeat = this.now();
-      return this.save(loop);
-    }
+    if (pr.headRefOid === loop.baseSha) return this.save(loop);
     this.note(loop, `看到新的 head ${short(pr.headRefOid)}`);
-    loop.pendingFix = null;
     return this.launchReview(loop, pr);
   }
 
@@ -831,23 +930,26 @@ export class PrLoop {
     const pr = await this.openPr(loop);
     if (!pr) return;
     if (!(await this.implAlive(loop))) return;
-    if (pr.headRefOid !== loop.reviewedSha) {
-      // The code changed after the review passed: the latest round must cover what gets merged
-      this.note(loop, `review 之後 head 變成 ${short(pr.headRefOid)}，重新 review`);
+    if (!passed(loop, pr.headRefOid)) {
+      // Nothing but a passing verdict on this very head leads on to CI and the merge
+      this.note(loop, `head ${short(pr.headRefOid)} 沒有最新一輪「可合併」的 review，重新 review`);
       return this.launchReview(loop, pr);
     }
     const ci = await this.gh.checks(loop.repo, loop.number);
+    if (ci.state !== 'none') loop.noCiSince = null;
     if (ci.state === 'pending') {
       loop.phase = 'waitingCi';
-      loop.heartbeat = this.now();
       return this.save(loop);
     }
     if (ci.state === 'fail') {
       const names = ci.failed.map(f => `${f.workflow}/${f.name}`);
       const repeated = loop.lastCiFail ? names.filter(n => loop.lastCiFail!.includes(n)) : [];
       loop.pendingFix = ciFailure(this.target(loop, pr), ci.failed);
+      loop.fixPending = true;
       loop.lastCiFail = names;
+      loop.phase = 'waitingFix';
       this.note(loop, `CI 失敗：${names.join(', ')}`);
+      await this.save(loop);
       if (repeated.length) {
         return this.halt(loop, 'repeated', `CI 連續兩次在同樣的檢查失敗：${repeated.join('、')}。\n\n${loop.pendingFix}`, 'fix');
       }
@@ -856,14 +958,22 @@ export class PrLoop {
       }
       return this.sendFix(loop);
     }
+    if (ci.state === 'none') {
+      // Checks may not be registered yet right after a push: "none" must hold a while
+      if (!loop.noCiSince || loop.noCiSince.sha !== pr.headRefOid) loop.noCiSince = { sha: pr.headRefOid, at: this.now() };
+      if (this.now() - loop.noCiSince.at < NO_CI_GRACE_MS) {
+        loop.phase = 'waitingCi';
+        return this.save(loop);
+      }
+    }
     loop.lastCiFail = null;
     if (pr.isDraft) return this.halt(loop, 'draft', 'review 與 CI 都通過，但 PR 還是 draft。標成 ready for review 後接續。', 'ci');
     if (pr.mergeable === 'CONFLICTING') return this.halt(loop, 'merge-conflict', 'review 與 CI 都通過，但 PR 與目標分支有衝突，需要先解決（可請實作 session 處理後 push，接著會重新 review）。', 'ci');
     const c = await this.config();
-    if (!c.allowedRepos.some(r => r.toLowerCase() === loop.repo.toLowerCase())) {
+    if (!c.allowedRepos.some(r => sameRepo(r, loop.repo))) {
       return this.halt(loop, 'not-allowed', `${loop.repo} 已經不在允許清單，不會合併。`, 'ci');
     }
-    const ciText = ci.state === 'none' ? '這個 repo 沒有設定 CI' : 'CI 全部通過';
+    const ciText = ci.state === 'none' ? `這個 repo 沒有設定 CI（${NO_CI_GRACE_MS / 60_000} 分鐘內都沒有出現檢查）` : 'CI 全部通過';
     if (c.merge === 'auto') {
       this.note(loop, `review 通過、${ciText}，依設定自動合併`);
       return this.merge(loop, pr);
@@ -875,12 +985,13 @@ export class PrLoop {
   }
 
   private askMerge(loop: Loop, ciText: string): void {
-    const last = loop.rounds[loop.rounds.length - 1];
+    // Written from the round itself; this is only reached through `passed`
+    const last = loop.rounds[loop.rounds.length - 1]!;
     const message = [
       `pr-loop：${loop.repo}#${loop.number}「${loop.title}」可以合併了。`,
-      `- 第 ${loop.round} 輪獨立 review（reviewer session \`${last?.reviewer ?? '?'}\`）判定可合併，沒有 blocking`,
+      `- 第 ${last.round} 輪獨立 review（reviewer session \`${last.reviewer}\`，commit \`${short(last.sha)}\`）的結論：${ROUND_TEXT[last.result]}，${last.blocking} 個 blocking`,
       `- ${ciText}`,
-      `- 會用一般 merge commit 合併 \`${loop.headRef}\` → \`${loop.baseRef}\`，只合併 review 過的 commit \`${short(loop.reviewedSha)}\`；不 squash、不 rebase、不刪分支`,
+      `- 會用一般 merge commit 合併 \`${loop.headRef}\` → \`${loop.baseRef}\`，只合併 review 過的 commit \`${short(last.sha)}\`；不 squash、不 rebase、不刪分支`,
       '',
       '要現在合併嗎？',
     ].join('\n');
@@ -903,7 +1014,7 @@ export class PrLoop {
             return this.guarded(now, async () => {
               const pr = await this.openPr(now);
               if (pr) await this.merge(now, pr);
-            });
+            }, 'ci');
           }
           const why = answer === 'failed' ? '確認卡片沒辦法顯示在實作 session（session 沒有開著？）。' : answer === null ? '確認卡片逾時沒有回應。' : '你選了先不要合併。';
           return this.halt(now, 'merge-declined', `${why}條件仍然滿足時，接續會重新檢查並再問一次。`, 'ci');
@@ -911,11 +1022,17 @@ export class PrLoop {
       );
   }
 
-  // The merge, re-checked against GitHub first: the reviewed head, no failing or pending CI, still allowed
+  // The merge, re-checked against GitHub first: the newest round passed for this very head, no failing or pending CI,
+  // still allowed
   private async merge(loop: Loop, pr: PullRequest): Promise<void> {
-    if (pr.headRefOid !== loop.reviewedSha) {
-      this.note(loop, `合併前發現 head 變成 ${short(pr.headRefOid)}，重新 review`);
+    if (!passed(loop, pr.headRefOid)) {
+      this.note(loop, `合併前發現 head ${short(pr.headRefOid)} 沒有最新一輪「可合併」的 review，重新 review`);
       return this.launchReview(loop, pr);
+    }
+    if (pr.isDraft || pr.mergeable === 'CONFLICTING') {
+      loop.phase = 'waitingCi';
+      await this.save(loop);
+      return this.waitingCi(loop);
     }
     const ci = await this.gh.checks(loop.repo, loop.number);
     if (ci.state === 'fail' || ci.state === 'pending') {
@@ -924,21 +1041,23 @@ export class PrLoop {
       return this.waitingCi(loop);
     }
     const c = await this.config();
-    if (!c.allowedRepos.some(r => r.toLowerCase() === loop.repo.toLowerCase())) {
+    if (!c.allowedRepos.some(r => sameRepo(r, loop.repo))) {
       return this.halt(loop, 'not-allowed', `${loop.repo} 已經不在允許清單，不會合併。`, 'ci');
     }
     loop.phase = 'merging';
     await this.save(loop);
+    let failure: string | null = null;
     try {
-      await this.gh.merge(loop.repo, loop.number, loop.reviewedSha);
+      await this.gh.merge(loop.repo, loop.number, pr.headRefOid);
     } catch (e) {
-      // A merge that failed on the way back may still have happened
-      const after = await this.gh.pr(loop.number, loop.repo).catch(() => null);
-      if (after?.state !== 'MERGED') {
-        return this.halt(loop, 'gh', `合併失敗：${(e as Error).message}`, 'ci');
-      }
+      failure = (e as Error).message;
     }
-    return this.finishMerge(loop);
+    // Whatever gh said, GitHub's state decides: a merge that failed on the way back may still have happened
+    const after = await this.gh.pr(loop.number, loop.repo);
+    if (after.state !== 'MERGED') {
+      return this.halt(loop, 'gh', failure ? `合併失敗：${failure}` : `合併指令回報成功，但 PR 的狀態是 ${after.state}。`, 'ci');
+    }
+    return this.finishMerge(loop, after);
   }
 
   private async recoverMerge(loop: Loop): Promise<void> {
@@ -950,8 +1069,7 @@ export class PrLoop {
     return this.halt(loop, 'interrupted', `合併途中引擎停止了，PR 目前是 ${pr.state}，沒有被合併。不會自動再合併一次。`, 'ci');
   }
 
-  private async finishMerge(loop: Loop, known?: PullRequest): Promise<void> {
-    const pr = known ?? (await this.gh.pr(loop.number, loop.repo));
+  private async finishMerge(loop: Loop, pr: PullRequest): Promise<void> {
     loop.phase = 'merged';
     loop.merge = { commit: pr.mergeCommit, at: this.now() };
     loop.pendingFix = null;
@@ -993,11 +1111,8 @@ export class PrLoop {
   }
 }
 
-class Cancelled extends Error {
-  constructor() {
-    super('the loop was cancelled');
-  }
-}
+// A step that must not write: the loop was cancelled, or another engine runs it
+class Aborted extends Error {}
 
 const SOURCE_TEXT: Record<Loop['requirementSource'], string> = {
   command: '指令參數',
@@ -1031,7 +1146,7 @@ export const HELP = [
   '- `/pr-loop stop [PR]`：停止循環',
   '- `/pr-loop resume [PR]`：接續停下的循環',
   '- `/pr-loop config`：查看設定',
-  '- `/pr-loop config allow <owner>/<repo>` / `disallow <owner>/<repo>`：允許清單',
+  '- `/pr-loop config allow <owner>/<repo>` / `disallow <owner>/<repo>`：允許清單（放寬限制的設定會先出確認卡片）',
   '- `/pr-loop config reviewer <agent id|same>`：reviewer 用的 agent',
   '- `/pr-loop config merge confirm|auto`：合併前確認或自動合併',
   '- `/pr-loop config poll <秒>`、`same-issue category+file|category`、`gh <argv>`',

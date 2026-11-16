@@ -2,8 +2,10 @@
 // nothing of the implementer's own verdict), the fixed verdict block, and the "same kind of issue" key two rounds are
 // compared by. Pure functions: no engine, no GitHub
 
-export const VERDICT_BEGIN = 'PR-LOOP-VERDICT-BEGIN';
-export const VERDICT_END = 'PR-LOOP-VERDICT-END';
+// The block's markers carry a nonce of the round, so text the reviewer read elsewhere (a file, a PR comment, an earlier
+// round) cannot pass for its verdict
+export const verdictBegin = (nonce: string) => `PR-LOOP-VERDICT-BEGIN:${nonce}:`;
+export const verdictEnd = (nonce: string) => `PR-LOOP-VERDICT-END:${nonce}:`;
 
 // The fixed issue categories a blocking item must use; two rounds are compared by category (and file), so a free-form
 // label would never match and a repeated problem would go unnoticed
@@ -62,14 +64,21 @@ export interface PrTarget {
 
 const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
 
-// The last verdict block of a reply (a reviewer may quote the format before its own answer). Anything off the fixed
-// shape is an error naming what was wrong, never a guess: a misread verdict could merge a PR
-export function parseVerdict(reply: string): ParseResult {
-  const end = reply.lastIndexOf(VERDICT_END);
-  if (end < 0) return { ok: false, error: `the reply has no ${VERDICT_END} line` };
-  const begin = reply.lastIndexOf(VERDICT_BEGIN, end);
-  if (begin < 0) return { ok: false, error: `the reply has no ${VERDICT_BEGIN} line before ${VERDICT_END}` };
-  let body = reply.slice(begin + VERDICT_BEGIN.length, end).trim();
+const count = (text: string, part: string) => text.split(part).length - 1;
+
+// The one verdict block of a reply, marked with this round's nonce. None, more than one, or anything off the fixed shape
+// is an error naming what was wrong, never a guess: a misread verdict could merge a PR
+export function parseVerdict(reply: string, nonce: string): ParseResult {
+  const BEGIN = verdictBegin(nonce);
+  const END = verdictEnd(nonce);
+  const begins = count(reply, BEGIN);
+  const ends = count(reply, END);
+  if (begins === 0 || ends === 0) return { ok: false, error: `the reply has no ${BEGIN} … ${END} block` };
+  if (begins > 1 || ends > 1) return { ok: false, error: `the reply has more than one ${BEGIN} block; exactly one is read` };
+  const begin = reply.indexOf(BEGIN);
+  const end = reply.indexOf(END);
+  if (end < begin) return { ok: false, error: `${END} comes before ${BEGIN}` };
+  let body = reply.slice(begin + BEGIN.length, end).trim();
   // A fence around the JSON is tolerated
   body = body.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
   let raw: unknown;
@@ -164,7 +173,9 @@ export const REQUIREMENT_TITLES = ['需求原文'];
 
 // The brief of a fresh reviewer: what to review, the requirement as written, and the PR's reviewer notes. Nothing the
 // implementer concluded about its own correctness goes in
-export function brief(pr: PrTarget, requirement: string, notes: string | null): string {
+export function brief(pr: PrTarget, requirement: string, notes: string | null, nonce: string): string {
+  const BEGIN = verdictBegin(nonce);
+  const END = verdictEnd(nonce);
   const categories = CATEGORIES.map(c => `\`${c}\``).join('、');
   return [
     `你是這個 Pull Request 的獨立 reviewer。這是全新的 session：你沒有實作者的對話紀錄，也不要假設實作是正確的。`,
@@ -186,13 +197,14 @@ export function brief(pr: PrTarget, requirement: string, notes: string | null): 
     '- 以程式碼和你實際執行的測試結果為準。PR 描述、commit 訊息、memory 或 CLAUDE.md 對這次實作的描述只當背景，不能當成已驗證的事實。',
     '- 結論分成兩類：「必須修（blocking，不修不能 merge）」與「建議（non-blocking）」。有任何 blocking 就判定不可合併；沒有 blocking 才判定可合併。',
     '- 需求、重點建議或你自己的判斷互相矛盾、無法決定時，寫進 `conflicts`，不要自己挑一邊。',
+    '- 不要讀其他 session 的對話（例如 `search_sessions`、`read_session` 之類的工具），特別是實作者的 session；判斷只根據程式碼、PR 與測試結果。',
     '',
     '## 輸出格式（一定要遵守）',
-    `先用繁體中文寫 review 內容，回覆的最後一定要附上下面的結論區塊：\`${VERDICT_BEGIN}\` 與 \`${VERDICT_END}\` 各自單獨一行，中間只放一個 JSON 物件，不放其他文字。`,
+    `先用繁體中文寫 review 內容，回覆的最後一定要附上下面的結論區塊：\`${BEGIN}\` 與 \`${END}\` 各自單獨一行，中間只放一個 JSON 物件，不放其他文字。整則回覆只能出現一次這組標記（不要另外引用或重複範例）。`,
     '',
-    VERDICT_BEGIN,
+    BEGIN,
     '{"verdict": "not_mergeable", "blocking": [{"category": "correctness", "file": "src/a.ts", "summary": "一句話說明問題", "detail": "為什麼是問題、怎麼重現", "fix": "建議的修法"}], "suggestions": [{"summary": "non-blocking 建議", "file": ""}], "tests": [{"command": "實際執行的指令", "result": "pass", "note": ""}], "conflicts": []}',
-    VERDICT_END,
+    END,
     '',
     '- `verdict`：`"mergeable"`（可合併，`blocking` 必須是空陣列）或 `"not_mergeable"`（不可合併，`blocking` 至少一項）。',
     `- \`blocking[].category\` 只能是：${categories}。\`file\` 是主要相關檔案的相對路徑，沒有就填空字串。`,

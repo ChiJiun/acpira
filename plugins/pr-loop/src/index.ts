@@ -16,11 +16,10 @@ function host(ctx: Context): Host {
     async newSession(agent, cwd) {
       const before = new Set((await sessions()).map(s => s.id));
       const r = await ctx.session.act({ type: 'newSession', agent, cwd });
-      // The plugin's own viewer moves to the new session; a failed start leaves it where it was
+      // The plugin's own viewer moves to the new session; a failed start leaves it where it was. No guessing from the
+      // list: a session the user opened meanwhile must never be taken for the reviewer
       const active = typeof r?.active === 'string' ? r.active : null;
-      if (active && !before.has(active)) return active;
-      const made = (await sessions()).find(s => !before.has(s.id) && s.cwd === cwd);
-      return made?.id ?? null;
+      return active && !before.has(active) ? active : null;
     },
     async send(session, text) {
       await ctx.session.send(session, text);
