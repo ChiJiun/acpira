@@ -22,7 +22,9 @@ use crate::i18n::tp;
 pub const CLIENT_NAME: &str = "acpira";
 pub const PROTOCOL_VERSION: i64 = 1;
 pub(crate) const KILL_GRACE: Duration = Duration::from_secs(5);
-pub const INIT_TIMEOUT: Duration = Duration::from_secs(30);
+// 120 s: claude-agent-acp 0.107.0 answered initialize in 28–50 s at normal priority on a loaded Windows machine, so
+// 30 s failed there even outside the below-normal job (`platform::windows_process`)
+pub const INIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub fn client_version() -> &'static str {
   acpira_shared::version::VERSION
