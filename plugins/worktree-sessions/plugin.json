@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "id": "worktree-sessions",
+  "version": "0.1.0",
+  "name": "Worktree sessions",
+  "description": "/worktree 為每件工作建立獨立的 git worktree 與分支，並在裡面開新 session",
+  "requires": ["node", "git"],
+  "contributes": {
+    "commands": [
+      {
+        "name": "worktree",
+        "description": "建立 git worktree 並在裡面開新 session；list 列出、remove 移除、config 設定位置",
+        "hint": "<分支> [起點] | list | remove [分支] | config"
+      }
+    ],
+    "runtime": {
+      "main": "plugin.ts",
+      "hooks": ["command"],
+      "methods": ["create", "opened", "list"]
+    }
+  }
+}
