@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "turn-report",
+  "version": "0.1.0",
+  "name": "Turn report",
+  "description": "After a turn that edited files or ran commands, asks the agent once for what it did, why, and what is left unverified when its reply leaves that out",
+  "requires": ["node"],
+  "contributes": {
+    "runtime": {
+      "main": "main.ts",
+      "events": ["turn.started", "turn.ended"],
+      "methods": ["status"]
+    }
+  }
+}
