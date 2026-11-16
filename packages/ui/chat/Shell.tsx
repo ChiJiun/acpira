@@ -1083,9 +1083,9 @@ export function Shell(p: ShellProps) {
   // What the switcher reaches: every project in the desktop app, the list's scope in an IDE (the session on screen always)
   const shownId = p.pendingSessionId ?? p.activeSessionId;
   // The desktop app's inbox and switcher reach what its session column lists: a removed project's sessions stay out
-  const listed = useMemo(() => desktop ? listedSessions(p.sessions, p.categories) : p.sessions, [desktop, p.sessions, p.categories]);
+  const columnSessions = useMemo(() => desktop ? listedSessions(p.sessions, p.categories) : p.sessions, [desktop, p.sessions, p.categories]);
   const switcherSessions = !switcher ? [] : desktop
-    ? (listed.some(s => s.id === shownId) ? listed : listed.concat(p.sessions.filter(s => s.id === shownId)))
+    ? (columnSessions.some(s => s.id === shownId) ? columnSessions : columnSessions.concat(p.sessions.filter(s => s.id === shownId)))
     : p.sessionScope === 'all' || !p.workspace ? p.sessions
     : p.sessions.filter(s => inWorkspace(s, p.workspace!) || s.id === shownId);
   const sessionsPanel = (
@@ -1684,7 +1684,7 @@ export function Shell(p: ShellProps) {
                 searchFiles={on.searchFiles} openEditor={openInEditor} openPlan={openPlanInEditor} shareSelection={p.shareEditorSelection} context={contextTab} />)}
           {/* Last, so it stays over the drawer of a narrow window. The files layout's left column is the explorer */}
           {desktop && <TitleRow onBack={trail.back} onForward={trail.forward}
-            inbox={!p.sample && <AttentionInbox sessions={listed}activeId={p.pendingSessionId ?? p.activeSessionId}
+            inbox={!p.sample && <AttentionInbox sessions={columnSessions} activeId={p.pendingSessionId ?? p.activeSessionId}
               categories={p.categories} chats={p.chats} onSelect={openSession} />}
             column={files
               ? { open: !explorerHidden, drawer: false, onToggle: leftSide }
