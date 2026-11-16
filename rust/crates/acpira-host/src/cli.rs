@@ -86,8 +86,42 @@ pub fn is_engine_command(first: Option<&str>) -> bool {
   )
 }
 
-/// Runs the command line `args` (without the program name) to its end; the exit code
+/// The stack of the thread `run` works on: what the main thread gets on Linux and macOS. The attached sidecar (`stdio`,
+/// `--ws`) and `agent` poll their work on that thread, a webview message's first step included (`util::run_prefix`), and
+/// a prompt's first poll runs down to the agent's request. Unoptimized, the poll frames of the dispatch matches
+/// (`BridgeCore::route`, `SessionManager::handle_for`) alone take hundreds of kilobytes, past the 1 MB a Windows main
+/// thread reserves
+pub const STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Runs the command line `args` (without the program name) to its end; the exit code. On Windows on a thread of its own
+/// with `STACK_SIZE`, since the main thread's 1 MB is the linker's choice, not this binary's (the desktop exe runs this
+/// too); elsewhere the main thread already has as much
 pub fn run(args: Vec<String>) -> i32 {
+  #[cfg(windows)]
+  {
+    on_stack(STACK_SIZE, move || run_here(args))
+  }
+  #[cfg(not(windows))]
+  {
+    run_here(args)
+  }
+}
+
+/// `f` on a new thread with `stack` bytes, waited for; a panic in it ends the process as one on the main thread would
+#[cfg_attr(not(any(windows, test)), expect(dead_code, reason = "only Windows needs the larger stack"))]
+fn on_stack<T: Send + 'static>(stack: usize, f: impl FnOnce() -> T + Send + 'static) -> T {
+  let thread = std::thread::Builder::new().name("acpira-main".into()).stack_size(stack).spawn(f);
+  match thread.map(std::thread::JoinHandle::join) {
+    Ok(Ok(out)) => out,
+    Ok(Err(panic)) => std::panic::resume_unwind(panic),
+    Err(e) => {
+      stderr(&format!("cannot start the main thread: {e}"));
+      std::process::exit(1);
+    }
+  }
+}
+
+fn run_here(args: Vec<String>) -> i32 {
   // First: the launcher is an old build that only ever waits for its child
   if args.first().map(String::as_str) == Some(crate::machine_engine::launcher::COMMAND) {
     return crate::machine_engine::launcher::run(&args[1..]);
@@ -800,5 +834,18 @@ mod tests {
     assert_eq!(idle_grace(Some("1"), true), std::time::Duration::from_secs(1));
     assert_eq!(idle_grace(Some("5"), false), std::time::Duration::from_secs(5));
     assert_eq!(idle_grace(Some(""), true), REMOTE_IDLE_GRACE);
+  }
+
+  /// Holds 64 KiB of stack per level: `depth + 1` levels
+  fn deep(depth: usize) -> usize {
+    let mut frame = [0u8; 64 * 1024];
+    std::hint::black_box(&mut frame);
+    if depth == 0 { 1 } else { 1 + deep(depth - 1) + std::hint::black_box(&frame)[depth] as usize }
+  }
+
+  // About 3 MB of stack: more than a test thread's 2 MB and a Windows main thread's 1 MB, well inside `STACK_SIZE`
+  #[test]
+  fn the_command_line_runs_on_a_stack_as_large_as_a_unix_main_thread() {
+    assert_eq!(on_stack(STACK_SIZE, || deep(47)), 48);
   }
 }

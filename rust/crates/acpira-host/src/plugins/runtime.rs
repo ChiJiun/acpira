@@ -28,8 +28,23 @@ use crate::store::transcript_store::LogFn;
 
 /// The protocol a process and the engine speak; `initialize` refuses any other
 pub const PROTOCOL_VERSION: u64 = 1;
-/// Longest a process may take to answer `initialize`
-pub const INIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a process may take to answer `initialize`, `migrate` and `activate` included, unless `INIT_TIMEOUT_ENV` says
+/// otherwise. 120 s, as for agents (`acp::transport::process::INIT_TIMEOUT`): on a loaded Windows machine Node alone
+/// took 10–40 s to start through a launcher shim, in a job below normal priority, so 10 s failed plugins that were fine
+pub const INIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Overrides `INIT_TIMEOUT`, in whole seconds (at least 1)
+pub const INIT_TIMEOUT_ENV: &str = "ACPIRA_PLUGIN_INIT_TIMEOUT";
+
+/// None when the variable is unset, not a whole number of seconds, or 0
+fn init_timeout_override(value: Option<&str>) -> Option<Duration> {
+  let secs = value?.trim().parse::<u64>().ok().filter(|s| *s > 0)?;
+  Some(Duration::from_secs(secs))
+}
+
+/// The time limit on `initialize` in effect: `INIT_TIMEOUT_ENV`, else `INIT_TIMEOUT`
+pub fn init_timeout() -> Duration {
+  init_timeout_override(std::env::var(INIT_TIMEOUT_ENV).ok().as_deref()).unwrap_or(INIT_TIMEOUT)
+}
 /// After `shutdown`, how long a process has to exit before it is killed
 const STOP_GRACE: Duration = Duration::from_secs(2);
 /// Failed calls in a row that open the circuit, and how long it stays open
@@ -284,12 +299,18 @@ pub struct Runtimes {
   data_root: PathBuf,
   /// The plugins in effect with their versions, whatever they contribute: what a dependency's `present` says
   present: parking_lot::RwLock<BTreeMap<String, String>>,
+  /// The limit on `initialize` (`init_timeout`), read once when the engine starts
+  init_timeout: Duration,
   log: LogFn,
 }
 
 impl Runtimes {
   /// `data_root` is the plugins' data folder (`~/.acpira/plugins/.data`)
   pub fn new(data_root: PathBuf, log: LogFn) -> Arc<Runtimes> {
+    Runtimes::with_init_timeout(data_root, log, init_timeout())
+  }
+
+  fn with_init_timeout(data_root: PathBuf, log: LogFn, init_timeout: Duration) -> Arc<Runtimes> {
     Arc::new(Runtimes {
       workers: Default::default(),
       wanted: Default::default(),
@@ -309,6 +330,7 @@ impl Runtimes {
       sync: Default::default(),
       data_root,
       present: Default::default(),
+      init_timeout,
       log,
     })
   }
@@ -750,7 +772,7 @@ impl Runtimes {
     if probe {
       init["probe"] = json!(true);
     }
-    let answer = match tokio::time::timeout(INIT_TIMEOUT, conn.request("initialize", init)).await {
+    let answer = match tokio::time::timeout(self.init_timeout, conn.request("initialize", init)).await {
       Ok(Ok(v)) => v,
       Ok(Err(e)) => {
         conn.close();
@@ -760,7 +782,8 @@ impl Runtimes {
       Err(_) => {
         conn.close();
         proc.stop().await;
-        return Err(tail.explain(format!("no answer to initialize within {} s", INIT_TIMEOUT.as_secs())).await);
+        let why = format!("no answer to initialize within {} s (`{INIT_TIMEOUT_ENV}` sets the limit)", self.init_timeout.as_secs());
+        return Err(tail.explain(why).await);
       }
     };
     if answer.get("protocolVersion").and_then(Value::as_u64) != Some(PROTOCOL_VERSION) {
@@ -944,7 +967,19 @@ impl StderrTail {
 /// Start the process of a frozen plugin, answer `initialize`, stop it: the dynamic check before a plugin with a
 /// runtime is enabled
 pub async fn probe(id: &str, hash: &str, dir: &Path, manifest: &crate::plugins::manifest::Manifest, data_root: &Path, log: LogFn) -> Result<(), String> {
-  let rt = Runtimes::new(data_root.to_path_buf(), log);
+  probe_within(id, hash, dir, manifest, data_root, log, init_timeout()).await
+}
+
+async fn probe_within(
+  id: &str,
+  hash: &str,
+  dir: &Path,
+  manifest: &crate::plugins::manifest::Manifest,
+  data_root: &Path,
+  log: LogFn,
+  limit: Duration,
+) -> Result<(), String> {
+  let rt = Runtimes::with_init_timeout(data_root.to_path_buf(), log, limit);
   let want = Want::of(id, hash, dir, manifest).ok_or("no runtime")?;
   let w = rt.start_as(&want, true).await?;
   w.stop().await;
@@ -1556,8 +1591,24 @@ export default definePlugin({
     let e = probe("rt", "h1", &a.dir, &bad, &root.path().join(".data"), Arc::new(|_: &str| {})).await.unwrap_err();
     assert!(e.contains("protocol 2"), "{e}");
     let silent = with(Some(vec!["sleep".into(), "30".into()]));
-    let t = Instant::now();
-    let e = probe("rt", "h1", &a.dir, &silent, &root.path().join(".data"), Arc::new(|_: &str| {})).await.unwrap_err();
-    assert!(e.contains("no answer") && t.elapsed() < INIT_TIMEOUT + Duration::from_secs(4), "{e}");
+    let (t, limit) = (Instant::now(), Duration::from_secs(3));
+    let e = probe_within("rt", "h1", &a.dir, &silent, &root.path().join(".data"), Arc::new(|_: &str| {}), limit).await.unwrap_err();
+    assert!(e.contains("no answer to initialize within 3 s") && e.contains(INIT_TIMEOUT_ENV), "{e}");
+    assert!(t.elapsed() < limit + Duration::from_secs(4), "{e}");
+  }
+}
+
+// Outside `tests`, which needs a Unix shell: the limit matters most on Windows
+#[cfg(test)]
+mod init_timeout_tests {
+  use super::*;
+
+  #[test]
+  fn the_init_timeout_override_takes_whole_seconds_and_ignores_the_rest() {
+    assert_eq!(init_timeout_override(Some("45")), Some(Duration::from_secs(45)));
+    assert_eq!(init_timeout_override(Some(" 300 ")), Some(Duration::from_secs(300)));
+    for v in [None, Some(""), Some("0"), Some("-5"), Some("1.5"), Some("30s"), Some("soon")] {
+      assert_eq!(init_timeout_override(v), None, "{v:?}");
+    }
   }
 }
