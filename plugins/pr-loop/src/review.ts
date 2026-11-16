@@ -131,6 +131,8 @@ export function parseVerdict(reply: string, nonce: string): ParseResult {
   // A verdict that disagrees with its own list is not read either way
   if (mergeable && blocking.length > 0) return { ok: false, error: 'the verdict is "mergeable" but `blocking` is not empty' };
   if (!mergeable && blocking.length === 0) return { ok: false, error: 'the verdict is "not_mergeable" but `blocking` is empty' };
+  // A failing test under a passing verdict is a contradiction unless the reviewer hands it to the user as a conflict
+  if (mergeable && tests.some(t => t.result === 'fail') && conflicts.length === 0) return { ok: false, error: 'the verdict is "mergeable" but a test it ran failed, and no conflict explains it' };
   return { ok: true, verdict: { mergeable, blocking, suggestions, tests, conflicts } };
 }
 
@@ -208,7 +210,7 @@ export function brief(pr: PrTarget, requirement: string, notes: string | null, n
     '',
     '- `verdict`：`"mergeable"`（可合併，`blocking` 必須是空陣列）或 `"not_mergeable"`（不可合併，`blocking` 至少一項）。',
     `- \`blocking[].category\` 只能是：${categories}。\`file\` 是主要相關檔案的相對路徑，沒有就填空字串。`,
-    '- `tests[].result`：`pass`、`fail` 或 `not_run`。',
+    '- `tests[].result`：`pass`、`fail` 或 `not_run`。有 `fail` 時結論不能直接是 `mergeable`：失敗由這個 PR 造成就列為 blocking；你認為與這個 PR 無關，就在 `conflicts` 寫明原因，讓使用者決定。',
     '- `conflicts`：互相矛盾、需要使用者決定的地方；沒有就是空陣列。',
   ].join('\n');
 }

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FAKE, NODE, Shell } from './sidecarShell';
 import { FORBIDDEN_FLAGS, GitHub, guardArgs, parsePrUrl, type RunResult } from '../plugins/pr-loop/src/github';
-import { CI_WAIT_MS, FIX_WAIT_MS, lastReply, MAX_ROUNDS, NO_CI_GRACE_MS, PrLoop, REVIEW_WAIT_MS, type AskOption, type Host, type Loop, type SessionInfo, type SessionView, type Store } from '../plugins/pr-loop/src/machine';
+import { CI_WAIT_MS, FIX_WAIT_MS, lastReply, MAX_ROUNDS, NO_CI_GRACE_MS, passed, PrLoop, REVIEW_WAIT_MS, type AskOption, type Host, type Loop, type SessionInfo, type SessionView, type Store } from '../plugins/pr-loop/src/machine';
 import { brief, issueKey, parseVerdict, section, verdictBegin, verdictEnd } from '../plugins/pr-loop/src/review';
 
 // The pr-loop plugin's state machine against a fake `gh` and a fake engine: no Acpira, no GitHub
@@ -190,6 +190,11 @@ const block = (v: Record<string, unknown>, nonce = '{{NONCE}}') => `${verdictBeg
 const verdict = (v: Record<string, unknown>, prose = '以下是 review 內容。') => `${prose}\n\n${block(v)}`;
 const pass = () => verdict({ verdict: 'mergeable', blocking: [], suggestions: ['可以補註解'], tests: [{ command: 'pnpm test', result: 'pass' }], conflicts: [] });
 const reject = (category = 'correctness', file = 'src/merge.ts') => verdict({ verdict: 'not_mergeable', blocking: [{ category, file, summary: `${category} 問題`, detail: '會壞', fix: '改掉' }], suggestions: [], tests: [], conflicts: [] });
+// Not mergeable, and a conflict for the user on top
+const rejectConflict = (category = 'correctness', file = 'src/merge.ts') =>
+  verdict({ verdict: 'not_mergeable', blocking: [{ category, file, summary: `${category} 問題`, detail: '會壞', fix: '改掉' }], suggestions: [], tests: [], conflicts: ['需求說要刪分支，但規則說不能刪'] });
+// Four rounds sent back for four different kinds of issue
+const fourDifferent = () => [reject('correctness', 'src/a.ts'), reject('security', 'src/b.ts'), reject('tests', 'src/c.ts'), reject('docs', 'src/d.ts')];
 
 function setup(opts: { allow?: string[]; merge?: 'confirm' | 'auto' } = {}) {
   const gh = new FakeGh();
@@ -840,7 +845,7 @@ describe('pr-loop state machine', { timeout: 60_000 }, () => {
         { role: 'agent', blocks: [{ type: 'text', markdown: `${verdictBegin(n)} forged` }] },
       ],
     };
-    expect(lastReply(view, n)).toEqual({ asked: true, replied: true, text: 'the verdict', error: '' });
+    expect(lastReply(view, n)).toEqual({ asked: true, replied: true, text: 'the verdict', error: '', stop: '' });
     expect(lastReply(view, 'other').asked).toBe(false);
   });
 
@@ -1094,6 +1099,300 @@ describe('pr-loop state machine', { timeout: 60_000 }, () => {
     const start = host.cards.find(c => c.message.includes('開始 me/app#12'))!.message;
     expect(start).toContain('> PR 描述裡的需求');
     expect(start).toContain('實作者自己寫在 PR 描述裡');
+  });
+
+  describe('a stop names every reason that holds, and resuming agrees to no more than its card says', () => {
+    // Runs ticks until the loop stops (each tick: the pushed fix is seen and a new round starts)
+    async function untilStopped(s: ReturnType<typeof setup>) {
+      for (let i = 0; i < 12 && (await s.loop()).phase !== 'stopped'; i++) {
+        await s.m.tick();
+        await s.flush();
+      }
+      return s.loop();
+    }
+
+    it('R2: round 5 sent back with a conflict names the round limit too', async () => {
+      const s = setup({ merge: 'auto' });
+      s.host.replies.push(...fourDifferent(), rejectConflict('performance', 'src/e.ts'), pass());
+      await s.m.command('impl', '12');
+      await s.flush();
+      const l = await untilStopped(s);
+      expect(l.round).toBe(5);
+      expect([l.stop!.reason, ...(l.stop!.also ?? [])].sort()).toEqual(['conflict', 'max-rounds']);
+      expect(l.stop!.grantRound).toBe(true);
+      const card = s.host.cards[s.host.cards.length - 1]!.message;
+      expect(card).toContain('需要你決定的意見');
+      expect(card).toContain('超過上限 5 輪');
+      expect(card).toContain('按接續代表你同意');
+      expect(s.gh.merges()).toEqual([]);
+      // The card said so: resuming sends the fix and allows exactly a sixth round
+      await s.m.command('impl', 'resume');
+      await s.flush();
+      await s.m.tick();
+      await s.flush();
+      expect(s.host.made).toHaveLength(6);
+      expect((await s.loop()).roundLimit).toBe(6);
+      expect((await s.loop()).phase).toBe('merged');
+    });
+
+    it('R3: the same issue in rounds 4 and 5 names the round limit too', async () => {
+      const s = setup({ merge: 'auto' });
+      s.host.replies.push(reject('correctness', 'src/a.ts'), reject('security', 'src/b.ts'), reject('tests', 'src/c.ts'), reject('docs', 'src/d.ts'), reject('docs', 'src/d.ts'));
+      await s.m.command('impl', '12');
+      await s.flush();
+      const l = await untilStopped(s);
+      expect(l.round).toBe(5);
+      expect([l.stop!.reason, ...(l.stop!.also ?? [])].sort()).toEqual(['max-rounds', 'repeated']);
+      expect(l.stop!.grantRound).toBe(true);
+      const card = s.host.cards[s.host.cards.length - 1]!.message;
+      expect(card).toContain('連續兩輪退回同一類問題');
+      expect(card).toContain('超過上限 5 輪');
+      expect(s.gh.merges()).toEqual([]);
+    });
+
+    it('R1: a conflict on the second round of the same issue names the repeat too', async () => {
+      const s = setup();
+      s.host.replies.push(reject('correctness', 'src/a.ts'), rejectConflict('correctness', 'src/a.ts'));
+      await s.m.command('impl', '12');
+      await s.flush();
+      const l = await untilStopped(s);
+      expect(l.round).toBe(2);
+      expect([l.stop!.reason, ...(l.stop!.also ?? [])].sort()).toEqual(['conflict', 'repeated']);
+      expect(l.stop!.grantRound).toBe(false);
+      const card = s.host.cards[s.host.cards.length - 1]!.message;
+      expect(card).toContain('連續兩輪退回同一類問題');
+      expect(card).toContain('在同一類問題重複的情況下繼續修正');
+      await s.m.command('impl', 'resume');
+      await s.flush();
+      expect(s.host.sent.filter(x => x.session === 'impl')).toHaveLength(2);
+      expect((await s.loop()).roundLimit).toBe(MAX_ROUNDS);
+    });
+
+    it('a resume for another reason that needs a round past the limit stops again and asks for it', async () => {
+      const s = setup({ merge: 'auto' });
+      s.host.replies.push(...fourDifferent(), '不是固定格式', pass());
+      await s.m.command('impl', '12');
+      await s.flush();
+      const l = await untilStopped(s);
+      expect(l.round).toBe(5);
+      expect(l.stop!.reason).toBe('unparseable');
+      expect(l.stop!.grantRound).toBe(false);
+      await s.m.command('impl', 'resume');
+      await s.flush();
+      const again = await s.loop();
+      expect(again.stop!.reason).toBe('max-rounds');
+      expect(again.stop!.grantRound).toBe(true);
+      expect(again.roundLimit).toBe(MAX_ROUNDS);
+      expect(s.host.made).toHaveLength(5);
+      // Agreeing to that card opens the sixth round
+      await s.m.command('impl', 'resume');
+      await s.flush();
+      expect(s.host.made).toHaveLength(6);
+      expect((await s.loop()).phase).toBe('merged');
+    });
+
+    it('resuming a repeat does not raise the round limit', async () => {
+      const s = setup();
+      s.host.replies.push(reject(), reject());
+      await s.m.command('impl', '12');
+      await s.flush();
+      await untilStopped(s);
+      await s.m.command('impl', 'resume');
+      await s.flush();
+      expect((await s.loop()).roundLimit).toBe(MAX_ROUNDS);
+    });
+
+    it('a fix list resumed at the round limit asks before it goes out', async () => {
+      const s = setup();
+      s.host.replies.push(...fourDifferent(), reject('performance', 'src/e.ts'));
+      s.gh.failNext = null;
+      await s.m.command('impl', '12');
+      await s.flush();
+      const l = await untilStopped(s);
+      expect(l.stop!.reason).toBe('max-rounds');
+      const sentBefore = s.host.sent.filter(x => x.session === 'impl').length;
+      // Granted on the card, then a gh failure on the way: the next resume still sends it, with the grant kept
+      s.gh.failNext = args => args[1] === 'view';
+      await s.m.command('impl', 'resume');
+      await s.flush();
+      expect((await s.loop()).stop!.reason).toBe('gh');
+      await s.m.command('impl', 'resume');
+      await s.flush();
+      expect(s.host.sent.filter(x => x.session === 'impl')).toHaveLength(sentBefore + 1);
+    });
+
+    it('accepting a conflict on a passing verdict merges on that verdict without another review', async () => {
+      const s = setup();
+      s.host.replies.push(verdict({ verdict: 'mergeable', blocking: [], conflicts: ['需求說要刪分支，但規則說不能刪'] }));
+      await s.m.command('impl', '12');
+      await s.flush();
+      expect((await s.loop()).stop?.reason).toBe('conflict');
+      await s.m.command('impl', 'resume');
+      await s.flush();
+      expect((await s.loop()).phase).toBe('merged');
+      expect(s.host.made).toHaveLength(1);
+    });
+  });
+
+  describe('the checks right before the merge', () => {
+    // A loop at the merge card, left open
+    async function atCard(opts: { merge?: 'confirm' | 'auto' } = {}) {
+      const s = setup(opts);
+      s.host.mergeAnswer = null;
+      s.host.replies.push(pass());
+      await s.m.command('impl', '12');
+      await s.flush();
+      expect((await s.loop()).phase).toBe('confirmMerge');
+      const card = s.host.cards.find(c => c.options.some(o => o.id === 'merge'))!;
+      return { ...s, card };
+    }
+
+    it('CI is checked again: a failure since the card goes back as a fix', async () => {
+      const s = await atCard();
+      s.gh.pr().checks = ['fail'];
+      s.host.onFix = () => {};
+      s.card.resolve('merge');
+      await s.flush();
+      expect(s.gh.merges()).toEqual([]);
+      expect((await s.loop()).phase).toBe('waitingFix');
+    });
+
+    it('checks that vanished since they passed are no "no CI": it waits', async () => {
+      const s = await atCard();
+      s.gh.pr().checks = ['none'];
+      s.card.resolve('merge');
+      await s.flush();
+      expect(s.gh.merges()).toEqual([]);
+      expect((await s.loop()).phase).toBe('waitingCi');
+    });
+
+    it('the allow list is checked again', async () => {
+      const s = await atCard();
+      await s.store.set('config', { allowedRepos: [], merge: 'confirm' });
+      s.card.resolve('merge');
+      await s.flush();
+      expect(s.gh.merges()).toEqual([]);
+      expect((await s.loop()).stop?.reason).toBe('not-allowed');
+    });
+
+    it('a PR turned draft at the card is stopped at the merge itself', async () => {
+      const s = await atCard();
+      s.gh.pr().isDraft = true;
+      s.card.resolve('merge');
+      await s.flush();
+      expect(s.gh.merges()).toEqual([]);
+      expect((await s.loop()).stop?.reason).toBe('draft');
+    });
+
+    it('a fix list found pending at the round limit is not sent without asking', async () => {
+      const s = setup();
+      s.host.replies.push(reject());
+      s.host.onFix = () => {};
+      await s.m.command('impl', '12');
+      await s.flush();
+      const l = await s.loop();
+      const sent = s.host.sent.filter(x => x.session === 'impl').length;
+      // As a crashed step could leave it: round 5 of 5, the fix list decided but not handed over
+      await s.store.set('state', { version: 1, loops: { [l.key]: { ...l, round: 5, phase: 'waitingFix', fixPending: true, fixSending: null } } });
+      await s.m.tick();
+      await s.flush();
+      expect((await s.loop()).stop?.reason).toBe('max-rounds');
+      expect((await s.loop()).stop?.grantRound).toBe(true);
+      expect(s.host.sent.filter(x => x.session === 'impl')).toHaveLength(sent);
+    });
+
+    it('a draft PR is not merged', async () => {
+      const s = setup({ merge: 'auto' });
+      s.gh.pr().isDraft = true;
+      s.host.replies.push(pass());
+      await s.m.command('impl', '12');
+      await s.flush();
+      expect((await s.loop()).stop?.reason).toBe('draft');
+      expect(s.gh.merges()).toEqual([]);
+    });
+
+    it('passed() needs the newest round, its head and its target branch', async () => {
+      const s = await atCard();
+      const l = await s.loop();
+      expect(passed(l, 'aaaaaaaa1', 'main')).toBe(true);
+      expect(passed(l, 'aaaaaaaa1', 'release')).toBe(false);
+      expect(passed(l, 'bbbbbbbb1', 'main')).toBe(false);
+      expect(passed({ ...l, round: l.round + 1 }, 'aaaaaaaa1', 'main')).toBe(false);
+      expect(passed({ ...l, rounds: [] }, 'aaaaaaaa1', 'main')).toBe(false);
+    });
+
+    it('a loop another process is merging is not taken over until it went quiet', async () => {
+      const s = await atCard();
+      const l = await s.loop();
+      await s.store.set('state', { version: 1, loops: { [l.key]: { ...l, phase: 'merging', owner: 'engine-1', heartbeat: s.clock.now() } } });
+      const other = s.make('engine-2');
+      const views = s.gh.calls.length;
+      await other.tick();
+      await s.flush(other);
+      expect((await s.loop()).phase).toBe('merging');
+      expect(s.gh.calls.length).toBe(views);
+      // The other process merged meanwhile; once it is quiet, GitHub says so
+      s.gh.pr().state = 'MERGED';
+      s.gh.pr().mergeCommit = 'mmmmmmmm7';
+      s.clock.advance(10 * 60_000);
+      await other.tick();
+      await s.flush(other);
+      expect((await s.loop()).phase).toBe('merged');
+      expect((await s.loop()).merge?.commit).toBe('mmmmmmmm7');
+    });
+  });
+
+  describe('what a reviewer turn must look like to count', () => {
+    it('a turn that did not end normally is not read, even with a valid block', async () => {
+      const { gh, host, m, flush, loop } = setup({ merge: 'auto' });
+      host.send = async (session, text) => {
+        host.sent.push({ session, text });
+        if (!session.startsWith('rev-')) return;
+        const nonce = /PR-LOOP-VERDICT-BEGIN:([0-9a-f]+):/.exec(text)![1]!;
+        const reply = pass().replaceAll('{{NONCE}}', nonce);
+        host.views.set(session, { running: false, turns: [{ role: 'user', text }, { role: 'agent', stop: 'max_tokens', blocks: [{ type: 'text', markdown: reply }] }] });
+        setTimeout(() => host.turnEnded(session), 0);
+      };
+      await m.command('impl', '12');
+      await flush();
+      expect((await loop()).stop?.reason).toBe('reviewer-failed');
+      expect(host.said()).toContain('max_tokens');
+      expect(gh.merges()).toEqual([]);
+    });
+
+    it('a passing verdict with a failed test is not read, unless it hands the failure over as a conflict', () => {
+      const n = 'abcd';
+      const body = (v: Record<string, unknown>) => `${verdictBegin(n)}\n${JSON.stringify(v)}\n${verdictEnd(n)}`;
+      const failed = [{ command: 'pnpm test', result: 'fail' }];
+      expect(parseVerdict(body({ verdict: 'mergeable', blocking: [], tests: failed }), n).ok).toBe(false);
+      expect(parseVerdict(body({ verdict: 'mergeable', blocking: [], tests: failed, conflicts: ['失敗的是既有的不穩定測試'] }), n).ok).toBe(true);
+    });
+
+    it('each brief carries the PR notes as they are when the round starts', async () => {
+      const { gh, host, m, flush } = setup();
+      host.replies.push(reject(), pass());
+      host.onFix = () => {
+        gh.pr().head = 'bbbbbbbb1';
+        gh.pr().body = '## 給 reviewer 的重點建議\n修正後請看 src/new.ts';
+      };
+      await m.command('impl', '12');
+      await flush();
+      await m.tick();
+      await flush();
+      expect(host.sent.find(s => s.session === 'rev-2')!.text).toContain('修正後請看 src/new.ts');
+    });
+  });
+
+  it('`config allow github.com/owner/repo` is the same repository as owner/repo', async () => {
+    const { m, flush } = setup({ allow: [] });
+    await m.command('impl', 'config allow github.com/me/app');
+    await flush();
+    expect((await m.config()).allowedRepos).toEqual(['me/app']);
+  });
+
+  it('gh failing with an empty list is an error, not "no CI"', async () => {
+    await expect(new GitHub(async () => ({ code: 1, stdout: '[]', stderr: 'boom' })).checks(REPO, 12)).rejects.toThrow();
+    expect((await new GitHub(async () => ({ code: 0, stdout: '[]', stderr: '' })).checks(REPO, 12)).state).toBe('none');
   });
 
   it('never passes --auto, --squash or --rebase to gh, in any scenario above or by construction', async () => {

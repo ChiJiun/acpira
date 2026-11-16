@@ -73,13 +73,18 @@ function runner(ctx: Context) {
 
 let machine: PrLoop | null = null;
 let log: (text: string) => void = () => {};
+// The process-wide handler is added once, however often the plugin is activated in it
+let listening = false;
 
 export default definePlugin({
   activate(ctx) {
     machine = new PrLoop({ host: host(ctx), store: store(ctx), gh: new GitHub(runner(ctx)), owner: `${process.pid}-${randomUUID()}` });
     log = text => ctx.log(text);
     // A rejection nobody handled must not end the plugin's process (Node's default): it is logged instead
-    process.on('unhandledRejection', e => ctx.log(`unhandled: ${(e as Error)?.stack ?? String(e)}`));
+    if (!listening) {
+      listening = true;
+      process.on('unhandledRejection', e => log(`unhandled: ${(e as Error)?.stack ?? String(e)}`));
+    }
     let timer: ReturnType<typeof setTimeout> | null = null;
     let closed = false;
     const loop = async () => {

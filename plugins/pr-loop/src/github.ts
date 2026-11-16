@@ -150,7 +150,11 @@ export class GitHub {
     }
     if (!Array.isArray(list)) throw failure();
     const checks = list as { name?: string; state?: string; bucket?: string; link?: string; workflow?: string; description?: string }[];
-    if (checks.length === 0) return { state: 'none' };
+    // An empty list is "no checks" only from a run that succeeded; gh failing with `[]` is a failure to read them
+    if (checks.length === 0) {
+      if (r.code !== 0) throw failure();
+      return { state: 'none' };
+    }
     const bucket = (c: (typeof checks)[number]) => String(c?.bucket ?? '').toLowerCase();
     const failed = checks.filter(c => bucket(c) === 'fail' || bucket(c) === 'cancel');
     if (failed.length) {
