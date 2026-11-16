@@ -1,12 +1,13 @@
 //! A Windows child and all of its descendants belong to one non-inheritable kill-on-close job.
 //! Start suspended, assign the job, then resume: even a fast native launcher cannot escape before assignment.
-//! Every such job is nested in one process-wide parent job that runs agents below normal priority under a CPU hard cap,
-//! so an agent's builds and test runs leave the desktop responsive (the `agentCpuCap` setting, `ACPIRA_AGENT_CPU_CAP`).
+//! Every such job is nested in one process-wide parent job that runs agents under a CPU hard cap and, by default, below
+//! normal priority, so an agent's builds and test runs leave the desktop responsive (the `agentCpuCap` and
+//! `agentPriority` settings, overridden by `ACPIRA_AGENT_CPU_CAP` and `ACPIRA_AGENT_PRIORITY`).
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use tokio::process::{Child, Command};
@@ -32,6 +33,11 @@ pub const CPU_CAP_ENV: &str = "ACPIRA_AGENT_CPU_CAP";
 /// settings last gave it; 0 when lifted
 static SETTING: AtomicU32 = AtomicU32::new(acpira_shared::settings::AGENT_CPU_CAP.2 as u32);
 static PARENT: OnceLock<Option<OwnedHandle>> = OnceLock::new();
+/// Whether the parent job's CPU rate control is on. Turning it off on a job that does not have it fails with
+/// ERROR_INVALID_PARAMETER, so a lifted cap only makes that call after a cap was actually set
+static RATE_ON: AtomicBool = AtomicBool::new(false);
+/// The `agentPriority` setting as the settings last gave it: true for `normal`
+static NORMAL_SETTING: AtomicBool = AtomicBool::new(false);
 
 fn own(handle: HANDLE) -> io::Result<OwnedHandle> {
   if handle.is_null() || handle == INVALID_HANDLE_VALUE {
@@ -49,22 +55,33 @@ fn set_info<T>(job: &OwnedHandle, class: JOBOBJECTINFOCLASS, info: &T) -> io::Re
   Ok(())
 }
 
-/// `normal` leaves agents at the priority they inherit; anything else (or unset) keeps them below normal
+/// Overrides the `agentPriority` setting: `normal` leaves agents at the priority they inherit, `belowNormal` keeps them
+/// below normal; unset or anything else follows the setting
 pub const PRIORITY_ENV: &str = "ACPIRA_AGENT_PRIORITY";
 
-/// False only for `ACPIRA_AGENT_PRIORITY=normal`. On a machine whose cores are already busy with normal-priority work a
-/// below-normal agent barely runs: claude-agent-acp 0.107.0 then never answered `initialize` (over 120 s, against
-/// 28–50 s at normal priority on the same loaded machine)
-fn below_normal(value: Option<&str>) -> bool {
-  !value.is_some_and(|v| v.trim().eq_ignore_ascii_case("normal"))
+/// Some(true) for below normal, Some(false) for normal, None when the variable is unset or names neither
+fn priority_override(value: Option<&str>) -> Option<bool> {
+  let v = value?.trim().to_ascii_lowercase().replace(['-', '_'], "");
+  match v.as_str() {
+    "normal" => Some(false),
+    "belownormal" | "below" => Some(true),
+    _ => None,
+  }
 }
 
-/// Below normal priority for every process in the job, unless `ACPIRA_AGENT_PRIORITY=normal`: a busy agent yields the
-/// CPU to whatever the user is doing
+/// Below normal unless the variable or the setting says `normal`. On a machine whose cores are already busy with
+/// normal-priority work a below-normal agent barely runs: claude-agent-acp 0.107.0 then never answered `initialize`
+/// (over 120 s, against 28–50 s at normal priority on the same loaded machine)
+fn below_normal() -> bool {
+  priority_override(std::env::var(PRIORITY_ENV).ok().as_deref()).unwrap_or_else(|| !NORMAL_SETTING.load(Ordering::Relaxed))
+}
+
+/// Below normal priority for every process in the job unless `below_normal` says otherwise: a busy agent yields the CPU
+/// to whatever the user is doing
 fn limits(flags: u32) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
   let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
   info.BasicLimitInformation.LimitFlags = flags;
-  if below_normal(std::env::var(PRIORITY_ENV).ok().as_deref()) {
+  if below_normal() {
     info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS;
     info.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
   }
@@ -81,15 +98,25 @@ fn effective_cap() -> u32 {
   cpu_cap_override(std::env::var(CPU_CAP_ENV).ok().as_deref()).unwrap_or_else(|| SETTING.load(Ordering::Relaxed))
 }
 
+/// Whether moving to `cap` needs a call at all: lifting a cap that is not on has nothing to turn off
+fn needs_rate_call(rate_on: bool, cap: u32) -> bool {
+  cap > 0 || rate_on
+}
+
 /// A hard cap in percent of all logical processors together, or rate control off at 0
 fn apply_cap(job: &OwnedHandle, cap: u32) -> io::Result<()> {
+  if !needs_rate_call(RATE_ON.load(Ordering::Relaxed), cap) {
+    return Ok(());
+  }
   let mut rate = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
   if cap > 0 {
     rate.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
     // In 1/100 of a percent
     rate.Anonymous.CpuRate = cap * 100;
   }
-  set_info(job, JobObjectCpuRateControlInformation, &rate)
+  set_info(job, JobObjectCpuRateControlInformation, &rate)?;
+  RATE_ON.store(cap > 0, Ordering::Relaxed);
+  Ok(())
 }
 
 /// The `agentCpuCap` setting (100 lifts the cap); takes effect at once for agents already running
@@ -102,9 +129,21 @@ pub fn set_cpu_cap(percent: u32) {
   }
 }
 
+/// The `agentPriority` setting (true for `normal`). Agents started afterwards take it; a running agent's own job keeps
+/// the priority it was spawned with, so a switch to normal reaches it only after a restart, while a switch back to below
+/// normal lowers it at once through the shared parent job
+pub fn set_agent_priority(normal: bool) {
+  NORMAL_SETTING.store(normal, Ordering::Relaxed);
+  if let Some(Some(job)) = PARENT.get()
+    && let Err(e) = set_info(job, JobObjectExtendedLimitInformation, &limits(0))
+  {
+    eprintln!("agent job: priority unchanged ({e})");
+  }
+}
+
 /// The parent of every per-spawn job. Priority alone does not help when the load is kernel time (process creation, file
 /// I/O through an antivirus filter), so the hard cap keeps a slice of every core free for the desktop. Created once; a
-/// failure leaves agents in their own jobs only, still below normal priority.
+/// failure leaves agents in their own jobs only, which still carry the priority `below_normal` picks.
 fn parent() -> Option<&'static OwnedHandle> {
   PARENT
     .get_or_init(|| {
@@ -112,12 +151,8 @@ fn parent() -> Option<&'static OwnedHandle> {
         // SAFETY: null security attributes make the new anonymous handle non-inheritable.
         let job = own(unsafe { CreateJobObjectW(null(), null()) })?;
         set_info(&job, JobObjectExtendedLimitInformation, &limits(0))?;
-        // A lifted cap sets nothing: turning rate control off on a job that never had it fails with
-        // ERROR_INVALID_PARAMETER, which lost the shared job altogether
-        let cap = effective_cap();
-        if cap > 0 {
-          apply_cap(&job, cap)?;
-        }
+        // A lifted cap makes no call (`needs_rate_call`): the refused one used to lose the shared job altogether
+        apply_cap(&job, effective_cap())?;
         io::Result::Ok(job)
       })();
       made.inspect_err(|e| eprintln!("agent job: no shared CPU limit ({e})")).ok()
@@ -215,15 +250,27 @@ pub fn process_info(pid: u32) -> Option<(u32, String)> {
 
 #[cfg(test)]
 mod tests {
-  use super::{below_normal, cpu_cap_override};
+  use super::{cpu_cap_override, needs_rate_call, priority_override};
 
   #[test]
-  fn only_an_explicit_normal_lifts_the_below_normal_priority() {
-    assert!(below_normal(None));
-    assert!(below_normal(Some("")));
-    assert!(below_normal(Some("below")));
-    assert!(!below_normal(Some("normal")));
-    assert!(!below_normal(Some(" Normal ")));
+  fn the_priority_override_names_normal_or_below_normal_and_defers_to_the_setting_otherwise() {
+    assert_eq!(priority_override(None), None);
+    assert_eq!(priority_override(Some("")), None);
+    assert_eq!(priority_override(Some("high")), None);
+    assert_eq!(priority_override(Some("normal")), Some(false));
+    assert_eq!(priority_override(Some(" Normal ")), Some(false));
+    assert_eq!(priority_override(Some("below")), Some(true));
+    assert_eq!(priority_override(Some("belowNormal")), Some(true));
+    assert_eq!(priority_override(Some("below_normal")), Some(true));
+    assert_eq!(priority_override(Some("BELOW-NORMAL")), Some(true));
+  }
+
+  #[test]
+  fn lifting_a_cap_that_was_never_set_makes_no_call() {
+    assert!(!needs_rate_call(false, 0));
+    assert!(needs_rate_call(true, 0));
+    assert!(needs_rate_call(false, 60));
+    assert!(needs_rate_call(true, 60));
   }
 
   #[test]

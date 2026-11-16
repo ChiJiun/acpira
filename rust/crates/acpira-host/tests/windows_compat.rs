@@ -98,15 +98,20 @@ fn priority_class(pid: u32) -> u32 {
   }
 }
 
+/// Spawns the fixture agent in this test binary's own process: the priority is read from the environment and settings
+/// of the process the job is made in, and the shared parent job is made once per process, so each case gets a fresh one
 #[tokio::test]
-async fn an_agent_and_what_it_spawns_run_below_normal_priority() {
-  use windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
-  // The helper asks for normal priority itself: the job's priority limit must still hold it below normal
+async fn priority_fixture_host() {
+  let Ok(receipt) = std::env::var("ACPIRA_PRIORITY_FIXTURE_RECEIPT") else { return };
+  if std::env::var("ACPIRA_PRIORITY_FIXTURE_SETTING").as_deref() == Ok("normal") {
+    acpira_host::platform::windows_process::set_agent_priority(true);
+  }
+  // The helper asks for normal priority itself: a below-normal job limit must still hold it below normal
   let mut cmd = tokio::process::Command::new("node");
   cmd
     .args([
       "-e",
-      "const h = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {stdio:'ignore'});        try { require('node:os').setPriority(h.pid, 0) } catch {} console.log(h.pid); setInterval(()=>{},1000)",
+      "const h = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {stdio:'ignore'}); try { require('node:os').setPriority(h.pid, 0) } catch {} console.log(h.pid); setInterval(()=>{},1000)",
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -116,10 +121,60 @@ async fn an_agent_and_what_it_spawns_run_below_normal_priority() {
   use tokio::io::AsyncBufReadExt;
   tokio::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).await.unwrap();
   let helper = Cleanup(line.trim().parse().unwrap());
-  assert_eq!(priority_class(child.id().unwrap()), BELOW_NORMAL_PRIORITY_CLASS);
-  assert_eq!(priority_class(helper.0), BELOW_NORMAL_PRIORITY_CLASS);
+  let report = format!("{} {} {}", priority_class(std::process::id()), priority_class(child.id().unwrap()), priority_class(helper.0));
   job.terminate();
   child.wait().await.unwrap();
+  std::fs::write(receipt, report).unwrap();
+}
+
+/// The fixture host's, the agent's and its helper's priority classes, from `priority_fixture_host` run with exactly this priority variable
+/// (None removes it, so a developer's own `ACPIRA_AGENT_PRIORITY` cannot decide the outcome) and setting
+fn fixture_priorities(variable: Option<&str>, setting: Option<&str>) -> (u32, u32, u32) {
+  let dir = tempfile::tempdir().unwrap();
+  let receipt = dir.path().join("priority.txt");
+  let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+  cmd
+    .args(["--exact", "priority_fixture_host"])
+    .env("ACPIRA_PRIORITY_FIXTURE_RECEIPT", &receipt)
+    .env_remove(acpira_host::platform::windows_process::PRIORITY_ENV)
+    .env_remove("ACPIRA_PRIORITY_FIXTURE_SETTING")
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+  if let Some(v) = variable {
+    cmd.env(acpira_host::platform::windows_process::PRIORITY_ENV, v);
+  }
+  if let Some(s) = setting {
+    cmd.env("ACPIRA_PRIORITY_FIXTURE_SETTING", s);
+  }
+  let status = cmd.status().unwrap();
+  let report = std::fs::read_to_string(&receipt).unwrap_or_default();
+  let mut classes = report.split_whitespace().filter_map(|c| c.parse::<u32>().ok());
+  match (classes.next(), classes.next(), classes.next()) {
+    (Some(host), Some(agent), Some(helper)) => (host, agent, helper),
+    _ => panic!("the priority fixture did not report ({status})"),
+  }
+}
+
+#[test]
+fn an_agent_and_what_it_spawns_run_below_normal_priority() {
+  use windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
+  let (_, agent, helper) = fixture_priorities(None, None);
+  assert_eq!((agent, helper), (BELOW_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS));
+}
+
+#[test]
+fn the_normal_priority_variable_and_setting_leave_agents_at_normal_priority() {
+  use windows_sys::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS};
+  // The agent keeps the priority it inherits from its host; the helper, which asked for normal, shows the job no
+  // longer lowers it
+  for (variable, setting) in [(Some("normal"), None), (None, Some("normal"))] {
+    let (host, agent, helper) = fixture_priorities(variable, setting);
+    assert_eq!(agent, host, "variable {variable:?}, setting {setting:?}");
+    assert_eq!(helper, NORMAL_PRIORITY_CLASS, "variable {variable:?}, setting {setting:?}");
+  }
+  // The variable outranks the setting
+  let (_, agent, helper) = fixture_priorities(Some("belowNormal"), Some("normal"));
+  assert_eq!((agent, helper), (BELOW_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS));
 }
 
 #[tokio::test]

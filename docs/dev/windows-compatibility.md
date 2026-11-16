@@ -11,7 +11,9 @@ Windows boundaries the code works around, their checks, and what lacks native ac
 - File lock liveness treats access denied as alive (`store::file_lock`).
 - File URLs are handled only in `platform::file_url`; encoded separators are rejected.
 - `canonicalize` yields `\\?\` paths and expands 8.3 names that Node keeps, breaking Pi trust and Node module resolution: `platform::paths::canonical_for_cli` converts for external CLIs and Node; real file access keeps the original path.
-- Agents run in a kill-on-close Job Object at below-normal priority under a CPU cap (`agentCpuCap`), since parallel runs under Defender starve the desktop in kernel time.
+- Agents run in a kill-on-close Job Object under a CPU cap (`agentCpuCap`, `ACPIRA_AGENT_CPU_CAP` overrides), since parallel runs under Defender starve the desktop in kernel time, and by default at below-normal priority (`agentPriority`, `ACPIRA_AGENT_PRIORITY=normal|belowNormal` overrides). On a machine whose cores are already busy with normal-priority work a below-normal agent barely runs and can miss the initialize deadline; `normal` is the way out. Both environment overrides are read by the engine process, which is long-lived and detached, so a changed variable needs an engine restart; the settings apply without one.
+- Turning CPU rate control off on a job that never had it fails with ERROR_INVALID_PARAMETER: a lifted cap only makes that call after a cap was set (`windows_process::needs_rate_call`).
+- A priority change reaches agents started afterwards: each agent's own job keeps the priority it was spawned with, so a switch to normal needs a restart of running agents (a switch back to below normal lowers them at once through the shared parent job).
 - Session lock takeover only targets a verified direct child of another sidecar (`lock_holder.rs`).
 - Remote / WSL: the backend OS decides command syntax; `agents.json` keeps local Windows and remote Linux config apart.
 - Release sidecars: MSVC target, static CRT (`scripts/release/sidecar-targets.mjs`).
