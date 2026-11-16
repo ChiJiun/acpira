@@ -70,11 +70,15 @@ export function describe(w: WorktreeStatus, sessions: SessionRef[]): string {
   if (!w.exists) parts.push('資料夾不存在（可 git worktree prune）');
   else if (w.dirty === null) parts.push('無法讀取狀態');
   else parts.push(w.dirty > 0 ? `${w.dirty} 個未 commit 變更` : '沒有未 commit 變更');
+  if (w.ignored) parts.push(`${w.ignored} 個被 ignore 的檔案或資料夾`);
   if (w.upstream) {
     parts.push(w.unpushed ? `${w.unpushed} 個 commit 未 push 到 ${w.upstream}` : `已與 ${w.upstream} 同步`);
+  } else if (w.noRemote) {
+    parts.push('repo 沒有設定遠端');
   } else if (w.branch && w.unpushed !== null) {
     parts.push(w.unpushed ? `沒有 upstream，${w.unpushed} 個 commit 不在任何遠端` : '沒有 upstream，commit 都已在遠端');
   }
+  if (w.unreferenced) parts.push(`detached HEAD 上有 ${w.unreferenced} 個 commit 不在任何分支`);
   if (w.locked) parts.push('已鎖定');
   parts.push(sessions.length ? `session：${sessions.map(s => s.title || s.id).join('、')}` : 'session：無');
   return parts.join(' · ');
@@ -84,6 +88,26 @@ export function label(w: WorktreeStatus): string {
   const name = w.branch ?? (w.bare ? '(bare)' : `(detached ${w.head?.slice(0, 7) ?? ''})`);
   const flags = [w.dirty ? '有變更' : '', w.unpushed ? `${w.unpushed} 未 push` : ''].filter(Boolean);
   return flags.length ? `${name}（${flags.join('，')}）` : name;
+}
+
+export interface LiveSession {
+  id: string;
+  title: string;
+  // SessionView.status of a session open in the engine; null when it is not open there
+  status: string | null;
+}
+
+// Session states whose agent process may still be running with its working directory in the worktree
+const RUNNING = ['starting', 'ready', 'auth_required'];
+
+// Why a worktree may not be removed while sessions use it, or null. On Windows a folder a process runs in cannot be
+// deleted: `git worktree remove` then unregisters the worktree and empties the folder but fails on the folder itself,
+// so a removal is refused while an agent may still run there
+export function liveSessionBlocker(platform: string, dir: string, sessions: LiveSession[]): string | null {
+  if (platform !== 'win32') return null;
+  const running = sessions.filter(s => s.status !== null && RUNNING.includes(s.status));
+  if (!running.length) return null;
+  return `有 ${running.length} 個 session 正在 ${dir} 執行（${running.map(s => s.title || s.id).join('、')}）。Windows 上無法刪除程式正在使用的資料夾，硬刪會留下清空一半的資料夾，所以不移除。請先讓這些 session 的 agent 停下來（不再需要的 session 可以刪除），再移除。`;
 }
 
 // A plain-text table of the listing, for a method's answer or a log

@@ -16,7 +16,7 @@
     "runtime": {
       "main": "plugin.ts",
       "hooks": ["command"],
-      "methods": ["create", "list"]
+      "methods": ["create", "opened", "list"]
     }
   }
 }

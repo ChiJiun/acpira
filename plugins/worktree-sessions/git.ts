@@ -2,7 +2,7 @@
 // repositories. Every git call goes through execFile (no shell), so paths with spaces or non-ASCII characters pass
 // through as single arguments. Errors a user can act on are WorktreeError with a stable `code`.
 import { execFile } from 'node:child_process';
-import { existsSync, readdirSync, rmdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 export type ErrorCode =
@@ -20,9 +20,13 @@ export type ErrorCode =
   | 'locked'
   | 'missing-folder'
   | 'dirty'
+  | 'unreferenced'
+  | 'remove-incomplete'
   | 'git-failed';
 
 export class WorktreeError extends Error {
+  // For `remove-incomplete`: whether git still registers the worktree after the failed removal
+  registered?: boolean;
   constructor(message: string, readonly code: ErrorCode) {
     super(message);
     this.name = 'WorktreeError';
@@ -145,10 +149,18 @@ export interface WorktreeStatus extends WorktreeEntry {
   exists: boolean;
   // Changed or untracked paths, null when the folder is gone or bare
   dirty: number | null;
+  // Ignored files and folders (`.env`, `build/`): not changes, but a removal deletes them
+  ignored: number | null;
   upstream: string | null;
-  // Commits on the branch the upstream lacks; without an upstream, commits found on no remote at all
+  // Commits on the branch the upstream lacks; without an upstream, commits found on no remote at all (null when the
+  // repository has no remote)
   unpushed: number | null;
   behind: number | null;
+  // The repository has no remote at all, so nothing is "pushed" or not
+  noRemote: boolean;
+  // Detached HEAD only: commits reachable from no branch, tag or remote, lost to everything but the reflog once the
+  // worktree goes
+  unreferenced: number | null;
 }
 
 // `git worktree list --porcelain -z`: NUL-terminated lines, an empty one between records
@@ -188,26 +200,37 @@ export async function worktreeEntries(repo: RepoInfo): Promise<WorktreeEntry[]> 
   return parseWorktreeList(r.stdout);
 }
 
-// Entries of `git status --porcelain -z`; a rename or copy carries its source as one more field
-export function countStatus(out: string): number {
+// Entries of `git status --porcelain -z --ignored`: `!!` marks an ignored path, everything else a change; a rename or
+// copy carries its source as one more field
+export function countStatus(out: string): { changed: number; ignored: number } {
   const fields = out.split('\0');
-  let n = 0;
+  let changed = 0;
+  let ignored = 0;
   for (let i = 0; i < fields.length; i++) {
     const f = fields[i];
     if (!f) continue;
-    n++;
+    if (f.startsWith('!!')) ignored++;
+    else changed++;
     if (f[0] === 'R' || f[0] === 'C') i++;
   }
-  return n;
+  return { changed, ignored };
 }
 
-async function statusOf(e: WorktreeEntry): Promise<WorktreeStatus> {
+async function statusOf(e: WorktreeEntry, hasRemote: boolean): Promise<WorktreeStatus> {
   const exists = existsSync(e.path) && statSync(e.path).isDirectory();
-  const base: WorktreeStatus = { ...e, exists, dirty: null, upstream: null, unpushed: null, behind: null };
+  const base: WorktreeStatus = { ...e, exists, dirty: null, ignored: null, upstream: null, unpushed: null, behind: null, noRemote: !hasRemote, unreferenced: null };
   if (!exists || e.bare) return base;
-  const st = await git(['status', '--porcelain', '-z', '--untracked-files=normal'], e.path);
-  if (st.code === 0) base.dirty = countStatus(st.stdout);
+  const st = await git(['status', '--porcelain', '-z', '--untracked-files=normal', '--ignored=traditional'], e.path);
+  if (st.code === 0) {
+    const c = countStatus(st.stdout);
+    base.dirty = c.changed;
+    base.ignored = c.ignored;
+  }
   if (!e.head || /^0+$/.test(e.head)) return base;
+  if (e.detached) {
+    const lost = await git(['rev-list', '--count', 'HEAD', '--not', '--branches', '--tags', '--remotes'], e.path);
+    if (lost.code === 0) base.unreferenced = Number(lost.stdout.trim());
+  }
   const up = await git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], e.path);
   if (up.code === 0 && up.stdout.trim()) {
     base.upstream = up.stdout.trim();
@@ -217,7 +240,7 @@ async function statusOf(e: WorktreeEntry): Promise<WorktreeStatus> {
       base.unpushed = ahead ?? null;
       base.behind = behind ?? null;
     }
-  } else {
+  } else if (hasRemote) {
     const rl = await git(['rev-list', '--count', 'HEAD', '--not', '--remotes'], e.path);
     if (rl.code === 0) base.unpushed = Number(rl.stdout.trim());
   }
@@ -232,7 +255,9 @@ export interface Listing {
 export async function listWorktrees(cwd: string): Promise<Listing> {
   const repo = await repoOf(cwd);
   const entries = await worktreeEntries(repo);
-  return { repo, worktrees: await Promise.all(entries.map(statusOf)) };
+  const remotes = await git(['remote'], repo.top);
+  const hasRemote = remotes.code !== 0 || remotes.stdout.trim().length > 0;
+  return { repo, worktrees: await Promise.all(entries.map(e => statusOf(e, hasRemote))) };
 }
 
 export interface CreateOptions {
@@ -268,32 +293,9 @@ async function resolveCommit(start: string, cwd: string): Promise<string | null>
   return r.code === 0 ? r.stdout.trim() : null;
 }
 
-// The nearest ancestor of `p` that exists, so a rollback removes only the folders this run created
-function existingAncestor(p: string): string {
-  let cur = path.dirname(p);
-  while (!existsSync(cur)) {
-    const up = path.dirname(cur);
-    if (up === cur) break;
-    cur = up;
-  }
-  return cur;
-}
-
-function removeIfEmpty(dir: string): boolean {
-  try {
-    if (existsSync(dir) && readdirSync(dir).length === 0) {
-      rmdirSync(dir);
-      return true;
-    }
-  } catch {
-    // left for the user: the error message names the path
-  }
-  return false;
-}
-
-// Create branch `branch` at `start` and a worktree for it. On any failure the repository is left as it was: a
-// half-registered worktree is removed, the branch this call made (still at `start`) is deleted, and folders it created
-// are removed when empty
+// Create branch `branch` at `start` and a worktree for it. The branch is made first, on its own (`git branch` refuses a
+// name that exists, atomically): it is this call's proof of ownership, so a failure afterwards undoes only what this
+// call made, even with another process creating the same branch or path at the same moment
 export async function createWorktree(o: CreateOptions): Promise<Created> {
   const repo = await repoOf(o.cwd);
   const branch = o.branch.trim();
@@ -315,25 +317,37 @@ export async function createWorktree(o: CreateOptions): Promise<Created> {
   if (registered) {
     throw new WorktreeError(`git 仍登記著路徑 ${target}（資料夾已不在）。請先在 repo 執行 git worktree prune 再重試。`, 'path-registered');
   }
-  const anchor = existingAncestor(target);
-  const r = await git(['worktree', 'add', '-b', branch, target, commit], repo.top);
-  if (r.code !== 0 || !existsSync(target)) {
-    await rollback(repo, target, anchor, branch, commit);
-    throw new WorktreeError(`git worktree add 失敗，已還原：${trimmed(r)}`, 'git-failed');
+  const made = await git(['branch', '--no-track', branch, commit], repo.top);
+  if (made.code !== 0) {
+    // Nothing of this call exists yet: nothing to undo
+    if (await branchExists(branch, repo.top)) {
+      throw new WorktreeError(`分支「${branch}」剛被其他操作建立。請換一個分支名稱。`, 'branch-exists');
+    }
+    throw new WorktreeError(`git branch 失敗：${trimmed(made)}`, 'git-failed');
+  }
+  const r = await git(['worktree', 'add', target, branch], repo.top);
+  if (r.code !== 0) {
+    const undone = await rollback(repo, target, branch, commit);
+    const code: ErrorCode = existsSync(target) && !undone.ownWorktree ? 'path-exists' : 'git-failed';
+    throw new WorktreeError(`git worktree add 失敗${undone.note}：${trimmed(r)}`, code);
   }
   return { repo, path: target, branch, start, commit };
 }
 
-async function rollback(repo: RepoInfo, target: string, anchor: string, branch: string, commit: string): Promise<void> {
-  const entries = await worktreeEntries(repo).catch(() => [] as WorktreeEntry[]);
-  // Only the worktree this call just added: it holds nothing but the checkout of `commit`
-  if (entries.some(e => samePath(e.path, target))) await git(['worktree', 'remove', '--force', target], repo.top);
-  removeIfEmpty(target);
-  for (let dir = path.dirname(target); samePathKey(dir).startsWith(samePathKey(anchor)) && !samePath(dir, anchor); dir = path.dirname(dir)) {
-    if (!removeIfEmpty(dir)) break;
+// Undo a failed `worktree add` of `branch`, which this call created at `commit`. Only what is provably this call's
+// goes: a worktree registered at `target` on `branch`, then the branch itself, deleted only while it still points at
+// `commit` and no worktree has it checked out (`update-ref -d` compares and deletes atomically). Folders are left to
+// git, which removes what its failed `worktree add` created; another process may be filling the same path
+async function rollback(repo: RepoInfo, target: string, branch: string, commit: string): Promise<{ ownWorktree: boolean; note: string }> {
+  let entries = await worktreeEntries(repo).catch(() => null);
+  const own = entries?.find(e => samePath(e.path, target) && e.branch === branch);
+  if (own) {
+    await git(['worktree', 'remove', '--force', own.path], repo.top);
+    entries = await worktreeEntries(repo).catch(() => null);
   }
-  const tip = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], repo.top);
-  if (tip.code === 0 && tip.stdout.trim() === commit) await git(['branch', '-D', branch], repo.top);
+  const checkedOut = entries === null || entries.some(e => e.branch === branch);
+  const deleted = !checkedOut && (await git(['update-ref', '-d', `refs/heads/${branch}`, commit], repo.top)).code === 0;
+  return { ownWorktree: !!own, note: deleted ? '，已還原' : `，分支「${branch}」留著（已有 worktree 使用或已有新 commit）` };
 }
 
 // Find a worktree by path or branch name
@@ -352,6 +366,12 @@ export function removalBlocker(e: WorktreeStatus): WorktreeError | null {
   if (e.dirty > 0) {
     return new WorktreeError(`worktree ${e.path} 有 ${e.dirty} 個未 commit 的變更（含未追蹤檔案），不移除。請先 commit、stash 或自行清掉後再試。`, 'dirty');
   }
+  if (e.detached && e.unreferenced === null) {
+    return new WorktreeError(`無法確認 ${e.path} 的 detached HEAD 是否有不在任何分支上的 commit，為安全起見不移除。`, 'git-failed');
+  }
+  if (e.unreferenced) {
+    return new WorktreeError(`worktree ${e.path} 是 detached HEAD，有 ${e.unreferenced} 個 commit 不在任何分支、tag 或遠端上，移除後只能從 reflog 找回，不移除。請先替它建立分支。`, 'unreferenced');
+  }
   return null;
 }
 
@@ -359,6 +379,7 @@ export interface Removed {
   path: string;
   branch: string | null;
   unpushed: number | null;
+  ignored: number | null;
 }
 
 // Look up and check a worktree for removal without touching it; `main` is the main working tree git runs in
@@ -376,6 +397,31 @@ export async function inspectRemoval(cwd: string, target: string): Promise<Workt
 export async function removeWorktree(cwd: string, target: string): Promise<Removed> {
   const e = await inspectRemoval(cwd, target);
   const r = await git(['worktree', 'remove', e.path], e.mainPath);
-  if (r.code !== 0) throw new WorktreeError(`git worktree remove 失敗：${trimmed(r)}`, 'git-failed');
-  return { path: e.path, branch: e.branch, unpushed: e.unpushed };
+  const done: Removed = { path: e.path, branch: e.branch, unpushed: e.unpushed, ignored: e.ignored };
+  if (r.code === 0) return done;
+  // git may have deleted part of the folder, or unregistered it and then failed on the folder itself (Windows, a
+  // process running in it): look again and say what is actually left
+  const entries = await git(['worktree', 'list', '--porcelain', '-z'], e.mainPath);
+  const registered = entries.code !== 0 || parseWorktreeList(entries.stdout).some(w => samePath(w.path, e.path));
+  const folder = existsSync(e.path);
+  if (!registered && !folder) return done;
+  let left = 0;
+  try {
+    left = folder ? readdirSync(e.path).length : 0;
+  } catch {
+    // unreadable: counted as nothing
+  }
+  const branch = e.branch ? `分支「${e.branch}」保留，commit 都還在。` : '';
+  const why = `（git：${trimmed(r)}）`;
+  let message: string;
+  if (!registered) {
+    message = `git 已取消 worktree ${e.path} 的登記，但資料夾刪不掉（可能有程式正在使用它，例如還在執行的 agent），裡面還剩 ${left} 個項目。${branch}關掉使用它的程式後，請手動刪除這個資料夾。${why}`;
+  } else if (folder) {
+    message = `git worktree remove 沒有完成，worktree ${e.path} 仍登記著，部分檔案可能已被刪除（還剩 ${left} 個項目）。worktree 原本是乾淨的，關掉使用它的程式後，可以在該資料夾執行 git checkout -- . 還原，或再移除一次。${branch}${why}`;
+  } else {
+    message = `資料夾 ${e.path} 已刪除，但 git 仍登記著它；可在 repo 執行 git worktree prune 清掉登記。${branch}${why}`;
+  }
+  const err = new WorktreeError(message, 'remove-incomplete');
+  err.registered = registered;
+  throw err;
 }

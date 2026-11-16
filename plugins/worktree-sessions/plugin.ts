@@ -6,7 +6,7 @@
 // user as toasts and question cards (`ui/ask`); expected failures are never thrown back to the engine.
 import { definePlugin, type Context } from '@acpira/plugin';
 import { createWorktree, inspectRemoval, listWorktrees, removeWorktree, repoOf, samePath, samePathKey, worktreeBase, WorktreeError, type Created, type WorktreeStatus } from './git';
-import { describe, label, parseCommand, table, USAGE, type SessionRef } from './core';
+import { describe, label, liveSessionBlocker, parseCommand, table, USAGE, type LiveSession, type SessionRef } from './core';
 
 const SETTINGS = 'settings';
 const LINKS = 'links';
@@ -68,25 +68,48 @@ async function sessionsIn(ctx: Context): Promise<{ id: string; title: string; cw
 
 export interface Opened {
   sessionId: string | null;
+  // Why no session was opened, or what went wrong with the one that was (its agent failed to start)
   sessionError?: string;
+  // `create` called with `wait: false`: the session is still being opened (see the `opened` method)
+  sessionPending?: boolean;
+}
+
+// Session states that mean the agent did not come up
+const START_FAILED: Record<string, string> = {
+  error: 'agent 啟動失敗',
+  auth_required: 'agent 需要先登入',
+  closed: 'session 已關閉',
+};
+
+async function backTo(ctx: Context, origin: string): Promise<boolean> {
+  const r = await ctx.session.act({ type: 'selectSession', id: origin }).catch(() => null);
+  if (r?.active !== origin) return false;
+  return !!(await ctx.session.get(origin, 0).catch(() => null));
 }
 
 // A new session in `dir` through the plugin's own viewer. The engine answers with the viewer's active session, which
 // stays the previous one when the start failed, so the session's folder is checked before it counts.
 //
 // Starting a session drops the viewer's current one when it is still empty and no other window shows it
-// (`drop_empty_current`). The viewer would otherwise still be on the session the last call opened, which the user may
-// not have used yet, so it first moves to `origin`, the session asking, which the user is looking at
+// (`drop_empty_current`). The viewer is therefore moved to `origin`, the session asking, before the start, and the
+// start is skipped unless the engine confirms the viewer is on it. Afterwards the viewer goes back to `origin` again,
+// so it never stays on the new session (a session a viewer shows is not marked unread)
 async function openSession(ctx: Context, dir: string, title: string, agent: string | undefined, origin: string): Promise<Opened> {
   try {
-    await ctx.session.act({ type: 'selectSession', id: origin });
+    if (!(await backTo(ctx, origin))) {
+      return { sessionId: null, sessionError: `找不到發出要求的 session（${origin}），為了不讓引擎丟掉其他還沒用過的 session，沒有開新 session` };
+    }
     const r = await ctx.session.act({ type: 'newSession', cwd: dir, ...(agent ? { agent } : {}) });
     const id = typeof r?.active === 'string' ? r.active : null;
     const view = id && id !== origin ? await ctx.session.get(id, 0) : null;
     if (!id || !view || typeof view.cwd !== 'string' || !samePath(view.cwd, dir)) {
+      await backTo(ctx, origin);
       return { sessionId: null, sessionError: `引擎沒有在 ${dir} 開出 session` };
     }
     await ctx.session.act({ type: 'renameSession', id, title }).catch(e => ctx.log(`rename failed: ${message(e)}`));
+    await backTo(ctx, origin);
+    const failed = typeof view.status === 'string' ? START_FAILED[view.status] : undefined;
+    if (failed) return { sessionId: id, sessionError: `${failed}${typeof view.error === 'string' && view.error ? `：${view.error}` : ''}` };
     return { sessionId: id };
   } catch (e) {
     return { sessionId: null, sessionError: message(e) };
@@ -108,25 +131,45 @@ export type CreateAnswer =
   | ({ ok: true; path: string; branch: string; commit: string; repo: string } & Opened)
   | { ok: false; code: string; error: string };
 
-async function create(ctx: Context, p: CreateParams): Promise<CreateAnswer> {
-  if (p.open !== false && !p.session) {
-    return { ok: false, code: 'bad-params', error: '開 session 需要 `session`（呼叫端所在、使用者正在看或已有對話的 session），否則請傳 `open: false`' };
-  }
+// Sessions `create` is still opening or has opened, by samePathKey of the worktree (this process only)
+const opening = new Map<string, { state: 'pending' | 'done' | 'failed' } & Opened>();
+
+async function openAndLink(ctx: Context, made: Created, p: CreateParams, origin: string): Promise<Opened> {
   return serial(async () => {
-    let made: Created;
-    try {
-      made = await createWorktree({ cwd: p.cwd, branch: p.branch, start: p.start, root: (await settings(ctx)).root });
-    } catch (e) {
-      return { ok: false, code: e instanceof WorktreeError ? e.code : 'error', error: message(e) };
-    }
-    const opened: Opened = p.open === false || !p.session ? { sessionId: null } : await openSession(ctx, made.path, made.branch, p.agent, p.session);
+    const opened = await openSession(ctx, made.path, made.branch, p.agent, origin);
     if (opened.sessionId) {
       const all = await links(ctx);
       all[samePathKey(made.path)] = { session: opened.sessionId, branch: made.branch, repo: made.repo.mainRoot, at: Date.now() };
       await ctx.storage.set(LINKS, all);
     }
-    return { ok: true, path: made.path, branch: made.branch, commit: made.commit, repo: made.repo.mainRoot, ...opened };
+    return opened;
   });
+}
+
+// `wait`: answer once the session is open (the command). Without it the answer comes as soon as the worktree exists
+// and the session opens in the background: starting an agent can take longer than a method call may
+async function create(ctx: Context, p: CreateParams, wait: boolean): Promise<CreateAnswer> {
+  if (p.open !== false && !p.session) {
+    return { ok: false, code: 'bad-params', error: '開 session 需要 `session`（呼叫端所在、使用者正在看或已有對話的 session），否則請傳 `open: false`' };
+  }
+  let made: Created;
+  try {
+    const root = (await settings(ctx)).root;
+    made = await serial(() => createWorktree({ cwd: p.cwd, branch: p.branch, start: p.start, root }));
+  } catch (e) {
+    return { ok: false, code: e instanceof WorktreeError ? e.code : 'error', error: message(e) };
+  }
+  const base = { ok: true as const, path: made.path, branch: made.branch, commit: made.commit, repo: made.repo.mainRoot };
+  if (p.open === false || !p.session) return { ...base, sessionId: null };
+  const job = openAndLink(ctx, made, p, p.session);
+  if (wait) return { ...base, ...(await job) };
+  const key = samePathKey(made.path);
+  opening.set(key, { state: 'pending', sessionId: null, sessionPending: true });
+  job.then(
+    o => opening.set(key, { state: o.sessionId ? 'done' : 'failed', ...o }),
+    e => opening.set(key, { state: 'failed', sessionId: null, sessionError: message(e) }),
+  );
+  return { ...base, sessionId: null, sessionPending: true };
 }
 
 interface Row {
@@ -195,15 +238,20 @@ async function remove(ctx: Context, p: CommandPayload, target: string | null): P
     pick = candidates[chosen]!.w.path;
   }
   const e = await inspectRemoval(cwd, pick);
+  const live = await liveSessionsIn(ctx, e.path);
+  const blocked = liveSessionBlocker(process.platform, e.path, live);
+  if (blocked) return toast(ctx, blocked, 'warning');
   const here = samePath(cwd, e.path) ? '這個 session 就在這個 worktree 裡，移除後它的資料夾會消失。' : '';
-  const using = (await sessionsIn(ctx)).filter(s => typeof s.cwd === 'string' && samePath(s.cwd, e.path));
-  const busy = using.length
-    ? `有 ${using.length} 個 session 的工作目錄在這裡（${using.map(s => s.title || s.id).join('、')}），session 不會被刪除；在 Windows 上，若它的 agent 程序還在執行，資料夾可能刪不乾淨，建議先停止這些 session。`
+  const busy = live.length
+    ? `有 ${live.length} 個 session 的工作目錄在這裡（${live.map(s => s.title || s.id).join('、')}），session 不會被刪除，但之後在它們裡面工作會找不到資料夾。`
     : '';
-  const pushed = e.unpushed ?`分支上有 ${e.unpushed} 個 commit 還沒 push，但分支會保留，commit 不會遺失。` : '';
+  const ignored = e.ignored ? `資料夾裡有 ${e.ignored} 個被 .gitignore 忽略的檔案或資料夾（例如 .env、build/），它們不算未 commit 的變更，但會一起被刪除，無法從 git 找回。` : '';
+  const keeps = e.branch
+    ? `分支「${e.branch}」不會刪除${e.unpushed ? `，上面有 ${e.unpushed} 個 commit 還沒 push，仍保存在這個分支上` : ''}。`
+    : 'HEAD 是 detached，但它的 commit 都已在其他分支、tag 或遠端上。';
   const answer = await ctx.ui.ask({
     session: p.session,
-    message: `將刪除資料夾 ${e.path} 並取消 git 的 worktree 登記（git worktree remove，不加 --force）。分支 ${e.branch ?? '(detached)'} 不會刪除，session 也不會刪除。${pushed}${here}${busy}`,
+    message: `將刪除資料夾 ${e.path} 並取消 git 的 worktree 登記（git worktree remove，不加 --force）。${keeps}session 不會刪除。${ignored}${here}${busy}`,
     questions: [{
       id: 'confirm', title: '確認移除', text: `確定要移除 worktree「${e.branch ?? e.path}」嗎？`, kind: 'single',
       options: [{ id: 'remove', label: '移除資料夾', description: e.path }, { id: 'keep', label: '取消', description: '' }],
@@ -214,13 +262,35 @@ async function remove(ctx: Context, p: CommandPayload, target: string | null): P
     await toast(ctx, '已取消，worktree 保留。');
     return;
   }
-  const done = await serial(() => removeWorktree(cwd, e.path));
-  const all = await links(ctx);
-  if (all[samePathKey(done.path)]) {
-    delete all[samePathKey(done.path)];
-    await ctx.storage.set(LINKS, all);
+  // A session may have started there while the card was open
+  const again = liveSessionBlocker(process.platform, e.path, await liveSessionsIn(ctx, e.path));
+  if (again) return toast(ctx, again, 'warning');
+  let removedPath = e.path;
+  try {
+    removedPath = (await serial(() => removeWorktree(cwd, e.path))).path;
+  } catch (err) {
+    // Unregistered but the folder stayed: the link goes, since git no longer knows the worktree
+    if (err instanceof WorktreeError && err.code === 'remove-incomplete' && err.registered === false) await unlink(ctx, e.path);
+    throw err;
   }
-  await toast(ctx, `已移除 worktree ${done.path}；分支 ${done.branch ?? '(detached)'} 保留。`);
+  await unlink(ctx, removedPath);
+  await toast(ctx, `已移除 worktree ${removedPath}；${e.branch ? `分支 ${e.branch} 保留` : 'detached HEAD 的 commit 都在其他參照上'}。`);
+}
+
+async function unlink(ctx: Context, dir: string): Promise<void> {
+  const all = await links(ctx);
+  if (!all[samePathKey(dir)]) return;
+  delete all[samePathKey(dir)];
+  await ctx.storage.set(LINKS, all);
+}
+
+// Sessions whose folder is `dir`, with their state when this engine has them open
+async function liveSessionsIn(ctx: Context, dir: string): Promise<LiveSession[]> {
+  const here = (await sessionsIn(ctx)).filter(s => typeof s.cwd === 'string' && samePath(s.cwd, dir));
+  return Promise.all(here.map(async s => {
+    const view = await ctx.session.get(s.id, 0).catch(() => null);
+    return { id: s.id, title: s.title, status: typeof view?.status === 'string' ? view.status : null };
+  }));
 }
 
 async function config(ctx: Context, p: CommandPayload, key: string | null, value: string | null): Promise<void> {
@@ -254,8 +324,9 @@ async function run(ctx: Context, p: CommandPayload): Promise<void> {
     case 'config':
       return config(ctx, p, parsed.key, parsed.value);
     case 'create': {
-      const r = await create(ctx, { cwd: p.cwd ?? '', branch: parsed.branch, start: parsed.start, agent: p.agent, session: p.session });
+      const r = await create(ctx, { cwd: p.cwd ?? '', branch: parsed.branch, start: parsed.start, agent: p.agent, session: p.session }, true);
       if (!r.ok) return toast(ctx, r.error, 'error');
+      if (r.sessionId && r.sessionError) return toast(ctx, `已建立 worktree ${r.path}（新分支 ${r.branch}）與 session「${r.branch}」，但${r.sessionError}。`, 'warning');
       if (r.sessionId) return toast(ctx, `已建立 worktree ${r.path}（新分支 ${r.branch}）。新 session「${r.branch}」已在側欄的 session 清單，點它開始在這個 worktree 工作。`);
       return toast(ctx, `已建立 worktree ${r.path}（新分支 ${r.branch}），但沒有開出 session：${r.sessionError ?? '原因不明'}。可以手動在這個資料夾開新 session。`, 'warning');
     }
@@ -274,12 +345,22 @@ export default definePlugin({
     },
   },
   methods: {
-    // { cwd, branch, start?, agent?, session?, open? } → { ok, path, branch, commit, repo, sessionId, sessionError? }
+    // { cwd, branch, start?, agent?, session?, open? } → { ok, path, branch, commit, repo, sessionId: null,
+    // sessionPending } at once; the session opens in the background (`opened` tells how it went)
     create: (params: CreateParams, ctx: Context) => {
       if (!params || typeof params.cwd !== 'string' || typeof params.branch !== 'string') {
         return { ok: false, code: 'bad-params', error: '`cwd` 與 `branch` 是必填字串' };
       }
-      return create(ctx, params);
+      return create(ctx, params, false);
+    },
+    // { path } → { state: 'pending' | 'done' | 'failed' | 'unknown', sessionId, sessionError? }
+    opened: async (params: { path?: string }, ctx: Context) => {
+      if (!params || typeof params.path !== 'string') return { state: 'unknown', sessionId: null, sessionError: '`path` 是必填字串' };
+      const key = samePathKey(params.path);
+      const known = opening.get(key);
+      if (known) return known;
+      const link = (await links(ctx))[key];
+      return link ? { state: 'done', sessionId: link.session } : { state: 'unknown', sessionId: null };
     },
     // { cwd } → { ok, repo, worktrees: [{ path, branch, head, main, exists, dirty, upstream, unpushed, behind, locked, sessions }] }
     list: async (params: { cwd?: string }, ctx: Context) => {
