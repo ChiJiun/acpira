@@ -1,6 +1,8 @@
-// approval-rules: the user's approval rules enforced by the harness. Every permission request of every agent passes
-// the `permission` hook; a request a rule matches gets the card even under full access (or is refused when the rule
-// says `deny`). A plugin can never approve, so nothing here loosens what the user decides.
+// approval-rules: the user's approval rules enforced by the harness. Every permission request an agent sends passes
+// the `permission` hook; a request a rule matches gets the card even under Acpira's synthesized full access (or is
+// refused when the rule says `deny`). An agent's own full-access mode that sends no request (Claude Code's
+// bypassPermissions, Codex full access) never reaches it. A plugin can never approve, so nothing here loosens what the
+// user decides.
 import { definePlugin } from '@acpira/plugin';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';

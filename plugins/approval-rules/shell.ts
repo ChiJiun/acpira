@@ -22,6 +22,26 @@ export interface Command {
   text: string;
   // The wrappers it was found inside (`bash -c`, `cmd /c`, `powershell -Command`, ...)
   via: string[];
+  // The folder it runs in after the `cd` / `pushd` / `Set-Location` before it on the line: '' for the folder the line
+  // started in, a path (relative to that folder, or absolute), or null when a change of folder could not be followed
+  cwd: string | null;
+}
+
+// Thrown when reading runs past the caller's deadline
+export class OutOfTime extends Error {
+  constructor() {
+    super('out of time');
+  }
+}
+
+interface State {
+  dir: string | null;
+  stack: (string | null)[];
+}
+
+interface Reading {
+  out: Analysis;
+  deadline: number;
 }
 
 export interface Opaque {
@@ -54,6 +74,10 @@ interface Nested {
 
 const MAX_DEPTH = 6;
 const MAX_LENGTH = 64 * 1024;
+// Sticky patterns read at an index instead of on a copy of the rest of the line
+const DOLLAR_NAME = /[A-Za-z_][A-Za-z0-9_]*(:[A-Za-z_][A-Za-z0-9_]*)?|[@*#?$!0-9-]/y;
+const DUP_TARGET = /\d+|-/y;
+const HEREDOC_START = /<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([A-Za-z0-9_.-]+))/y;
 
 const RESERVED = new Set(['!', 'if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', 'time', 'coproc', '{', '}', 'function']);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
@@ -77,6 +101,9 @@ class Lexer {
   // Every heredoc body, for a shell that reads its script from input
   seen: string[] = [];
   private cur: Word | null = null;
+  // Brace groups opened by a `{` read as an operator, and `{` kept inside the current word (`{a,b}`, `{}`)
+  private groups = 0;
+  private wordBraces = 0;
   private heredocs: { delim: string; strip: boolean; quoted: boolean }[] = [];
   private wantDelim: { strip: boolean } | null = null;
 
@@ -100,6 +127,7 @@ class Lexer {
     if (!this.cur) return;
     const w = this.cur;
     this.cur = null;
+    this.wordBraces = 0;
     if (this.wantDelim) {
       this.heredocs.push({ delim: w.text, strip: this.wantDelim.strip, quoted: w.quoted });
       this.wantDelim = null;
@@ -233,13 +261,21 @@ class Lexer {
         continue;
       }
       if (c === '{' || c === '}') {
-        // PowerShell script blocks always split; in a POSIX shell a brace groups only as a word of its own
-        const alone = this.cur === null && (c === '}' || next === undefined || /\s/.test(next));
-        if (d === 'ps' || alone) {
+        // PowerShell script blocks always split. A POSIX reading splits them too, because a PowerShell line read as
+        // POSIX must not hide `{Remove-Item x}`: a `{` starting a word is a group unless the word is a brace expansion
+        // (`{a,b}`, `{1..3}`) or find's `{}`, and a `}` closes a group opened that way (or stands alone)
+        let split = d === 'ps';
+        if (!split && c === '{') split = this.cur === null && !this.braceWord();
+        if (!split && c === '}') split = this.wordBraces === 0 && (this.cur === null || this.groups > 0);
+        if (split) {
+          if (c === '{') this.groups++;
+          else if (this.groups > 0) this.groups--;
           this.op(c);
           this.i++;
           continue;
         }
+        if (c === '{') this.wordBraces++;
+        else if (this.wordBraces > 0) this.wordBraces--;
       }
       if (c === '<' || c === '>') {
         this.angle();
@@ -250,6 +286,27 @@ class Lexer {
     }
     this.flush();
     if (this.heredocs.length) this.problems.push('unterminated heredoc');
+  }
+
+  // Whether the `{` here starts a brace expansion or `{}` rather than a group (looks at most 64 characters ahead)
+  private braceWord(): boolean {
+    const { s } = this;
+    const limit = Math.min(s.length, this.i + 64);
+    let depth = 0;
+    for (let j = this.i + 1; j < limit; j++) {
+      const c = s[j]!;
+      if (' \t\r\n;|&<>()\'"'.includes(c)) return false;
+      if (c === '{') depth++;
+      else if (c === '}') {
+        if (depth > 0) {
+          depth--;
+          continue;
+        }
+        const body = s.slice(this.i + 1, j);
+        return body === '' || body.includes(',') || body.includes('..');
+      }
+    }
+    return false;
   }
 
   private single(): void {
@@ -352,7 +409,8 @@ class Lexer {
       this.i = end + 1;
       return;
     }
-    const name = /^[A-Za-z_][A-Za-z0-9_]*(:[A-Za-z_][A-Za-z0-9_]*)?|^[@*#?$!0-9-]/.exec(s.slice(this.i + 1));
+    DOLLAR_NAME.lastIndex = this.i + 1;
+    const name = DOLLAR_NAME.exec(s);
     if (name) {
       this.add(s.slice(this.i, this.i + 1 + name[0].length), true);
       this.i += 1 + name[0].length;
@@ -423,7 +481,8 @@ class Lexer {
     }
     // `>&2`, `2>&1`, `>&-`: a descriptor copy, no file
     if (next === '&') {
-      const m = /^(\d+|-)/.exec(s.slice(this.i + 2));
+      DUP_TARGET.lastIndex = this.i + 2;
+      const m = DUP_TARGET.exec(s);
       if (m) {
         if (this.cur && !this.cur.quoted && /^\d+$/.test(this.cur.text)) this.cur = null;
         this.flush();
@@ -501,7 +560,8 @@ function matchParen(s: string, open: number): number {
       continue;
     }
     if (c === '<' && s[i + 1] === '<' && s[i + 2] !== '<') {
-      const m = /^<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([A-Za-z0-9_.-]+))/.exec(s.slice(i));
+      HEREDOC_START.lastIndex = i;
+      const m = HEREDOC_START.exec(s);
       if (m) {
         pending.push({ delim: m[2] ?? m[3] ?? m[4] ?? '', strip: m[1] === '-' });
         i += m[0].length - 1;
@@ -564,13 +624,22 @@ function segments(toks: Tok[]): Segment[] {
 
 const lit = (text: string): Word => ({ text, dynamic: false, quoted: false });
 
-export function analyze(src: string, dialect: Dialect = 'posix'): Analysis {
+// `deadline` (a Date.now() value): past it the reading stops with OutOfTime
+export function analyze(src: string, dialect: Dialect = 'posix', deadline = Infinity): Analysis {
   const out: Analysis = { commands: [], opaque: [], problems: [] };
-  read(src, dialect, 0, [], out);
+  read(src, dialect, 0, [], { out, deadline }, { dir: '', stack: [] });
   return out;
 }
 
-function read(src: string, dialect: Dialect, depth: number, via: string[], out: Analysis): void {
+function tick(r: Reading): void {
+  if (r.deadline !== Infinity && Date.now() > r.deadline) throw new OutOfTime();
+}
+
+const copy = (st: State): State => ({ dir: st.dir, stack: [...st.stack] });
+
+function read(src: string, dialect: Dialect, depth: number, via: string[], r: Reading, st: State): void {
+  const { out } = r;
+  tick(r);
   if (depth > MAX_DEPTH) {
     out.problems.push('nested too deeply');
     out.opaque.push({ text: src, why: 'nested too deeply' });
@@ -584,18 +653,25 @@ function read(src: string, dialect: Dialect, depth: number, via: string[], out: 
   lx.run();
   out.problems.push(...lx.problems);
   for (const body of lx.live) out.opaque.push({ text: body, why: 'heredoc with substitutions' });
-  for (const n of lx.nested) read(n.src, n.dialect, depth + 1, [...via, n.why], out);
+  const segs = segments(lx.toks);
+  // A substitution runs in a subshell and its `cd` does not carry over; it is read before the line's commands, so
+  // when the line changes folder the substitution's folder is not known
+  const moves = segs.some(seg => seg.words.some(w => CD.has(programName(w.text)) || POPD.has(programName(w.text))));
+  for (const n of lx.nested) read(n.src, n.dialect, depth + 1, [...via, n.why], r, moves ? { dir: null, stack: [] } : copy(st));
   const before = out.commands.length;
-  for (const seg of segments(lx.toks)) expand(seg.words, seg.redirects, dialect, depth, via, out);
+  for (const seg of segs) {
+    tick(r);
+    expand(seg.words, seg.redirects, dialect, depth, via, r, st);
+  }
   // A shell or interpreter run without an inline script reads it from a file or its input (`curl … | sh`,
   // `sh <<EOF`), which cannot be read here: the whole line and the heredoc bodies go to the keyword checks
-  if (out.commands.slice(before).some(c => c.via.length === via.length && SCRIPT_READERS.has(c.program))) {
+  if (out.commands.slice(before).some(c => c.via.length === via.length && SCRIPT_READERS.has(interpreter(c.program)))) {
     out.opaque.push({ text: src, why: 'a shell reads its script from elsewhere' });
     for (const b of lx.seen) out.opaque.push({ text: b, why: 'heredoc read by a shell' });
   }
 }
 
-const SCRIPT_READERS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'ash', 'fish', 'python', 'python3', 'py', 'node', 'perl', 'ruby', 'pwsh', 'powershell', 'cmd', 'source', '.']);
+const SCRIPT_READERS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'ash', 'fish', 'python', 'pypy', 'py', 'node', 'perl', 'ruby', 'php', 'lua', 'pwsh', 'powershell', 'cmd', 'source', '.']);
 
 const joined = (ws: Word[]) => ws.map(w => w.text).join(' ');
 
@@ -616,6 +692,8 @@ const VALUE_FLAGS: Record<string, string[]> = {
   wsl: ['-d', '--distribution', '-u', '--user', '--cd', '--shell-type'],
   su: ['-s', '--shell', '-g', '--group'],
 };
+
+const UV_VALUE_FLAGS = ['--with', '-w', '--python', '-p', '--project', '--directory', '--package', '--env-file', '--from', '--spec', '--index', '--extra', '--group', '-e', '--environment'];
 
 const PS_VALUE_FLAGS = new Set([
   '-executionpolicy', '-ep', '-ex', '-exec', '-windowstyle', '-w', '-win', '-version', '-v', '-inputformat', '-if', '-inp',
@@ -664,9 +742,74 @@ const INLINE_FLAGS: Record<string, string[]> = {
   ruby: ['-e'],
   php: ['-r'],
   osascript: ['-e'],
+  lua: ['-e'],
+  rscript: ['-e'],
 };
 
-function expand(input: Word[], redirs: Segment['redirects'], dialect: Dialect, depth: number, via: string[], out: Analysis): void {
+// Versioned interpreter names under their family: python3.12, pythonw, nodejs, ruby3.2, perl5.36
+export function interpreter(program: string): string {
+  if (/^python(\d+(\.\d+)*)?w?$/.test(program)) return 'python';
+  if (/^pypy\d*(\.\d+)*$/.test(program)) return 'pypy';
+  if (/^node(js)?\d*$/.test(program)) return 'node';
+  if (/^ruby\d*(\.\d+)*$/.test(program)) return 'ruby';
+  if (/^perl\d*(\.\d+)*$/.test(program)) return 'perl';
+  if (/^php\d*(\.\d+)*$/.test(program)) return 'php';
+  if (/^lua\d*(\.\d+)*$/.test(program)) return 'lua';
+  return program;
+}
+
+// The folder commands change to (`cd`, `chdir`, `pushd`, `Set-Location`, `Push-Location`) and back from
+const CD = new Set(['cd', 'chdir', 'pushd', 'set-location', 'sl', 'push-location']);
+const POPD = new Set(['popd', 'pop-location']);
+const ABSOLUTE = /^(\/|~|[A-Za-z]:|\\\\)/;
+
+function changeDir(cmd: Command, words: Word[], dialect: Dialect, st: State): void {
+  const p = cmd.program;
+  if (POPD.has(p)) {
+    st.dir = st.stack.length ? st.stack.pop()! : null;
+    return;
+  }
+  if (!CD.has(p)) return;
+  let target: Word | undefined;
+  let count = 0;
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i]!;
+    const t = w.text.toLowerCase();
+    if (!w.quoted && ['-path', '-literalpath', '-lp', '-pspath'].includes(t)) {
+      target = words[++i];
+      count++;
+      continue;
+    }
+    // `cd -L` / `-P` / `-e`, `cd /d` (cmd.exe), Set-Location's switches
+    if (!w.quoted && ['-l', '-p', '-e', '/d', '--', '-stackname', '-passthru'].includes(t)) {
+      if (t === '-stackname') i++;
+      continue;
+    }
+    target ??= w;
+    count++;
+  }
+  const from = st.dir;
+  if (p === 'pushd' || p === 'push-location') st.stack.push(from);
+  if (count > 1 || (target && (target.dynamic || target.text === '-'))) {
+    st.dir = null;
+    return;
+  }
+  // `cd` alone: home in a POSIX shell and PowerShell 7, no change in cmd.exe
+  const to = target ? target.text.replace(/\\/g, '/') : dialect === 'cmd' ? '' : '~';
+  if (!target && dialect === 'cmd') return;
+  if (ABSOLUTE.test(to)) st.dir = to;
+  else if (from === null) st.dir = null;
+  else st.dir = from ? `${from}/${to}` : to;
+}
+
+function expand(input: Word[], redirs: Segment['redirects'], dialect: Dialect, depth: number, via: string[], r: Reading, st: State): void {
+  const { out } = r;
+  // find -exec inside find -exec: as deep as read() allows
+  if (depth > MAX_DEPTH) {
+    out.problems.push('nested too deeply');
+    out.opaque.push({ text: joined(input), why: 'nested too deeply' });
+    return;
+  }
   let ws = input.slice();
   while (ws.length && !ws[0]!.quoted && RESERVED.has(ws[0]!.text)) ws.shift();
   // `for x in ...` / `case $x in` / `select`: the words are data
@@ -674,12 +817,13 @@ function expand(input: Word[], redirs: Segment['redirects'], dialect: Dialect, d
   // `FOO=1 BAR="a b" cmd` (a quoted value marks the word quoted; a quoted name is too rare to tell apart)
   if (dialect !== 'cmd') while (ws.length && ASSIGNMENT.test(ws[0]!.text)) ws.shift();
   const redirects = redirs.flatMap(r => (r.target ? [{ op: r.op, target: r.target.text }] : []));
-  const sub = (src: string, d: Dialect, why: string) => read(src, d, depth + 1, [...via, why], out);
+  const sub = (src: string, d: Dialect, why: string) => read(src, d, depth + 1, [...via, why], r, copy(st));
   const emit = (words: Word[]) => {
     const argv = words.map(w => w.text);
     const first = words[0];
-    const cmd: Command = { argv, program: first ? programName(first.text) : '', dynamic: !!first?.dynamic, redirects, text: argv.join(' '), via };
+    const cmd: Command = { argv, program: first ? programName(first.text) : '', dynamic: !!first?.dynamic, redirects, text: argv.join(' '), via, cwd: st.dir };
     out.commands.push(cmd);
+    changeDir(cmd, words, dialect, st);
     if (cmd.dynamic) out.opaque.push({ text: cmd.text, why: 'the program is an expansion' });
     // find -exec / -execdir / -ok: the words up to `;` or `+` are a command of their own
     if (cmd.program === 'find') {
@@ -687,12 +831,12 @@ function expand(input: Word[], redirs: Segment['redirects'], dialect: Dialect, d
         if (!['-exec', '-execdir', '-ok', '-okdir'].includes(words[i]!.text)) continue;
         let j = i + 1;
         while (j < words.length && words[j]!.text !== ';' && words[j]!.text !== '+') j++;
-        expand(words.slice(i + 1, j), [], dialect, depth + 1, [...via, 'find -exec'], out);
+        expand(words.slice(i + 1, j), [], dialect, depth + 1, [...via, 'find -exec'], r, copy(st));
         i = j;
       }
     }
     // Inline code given to an interpreter is read for keywords only
-    const inline = INLINE_FLAGS[cmd.program];
+    const inline = INLINE_FLAGS[interpreter(cmd.program)];
     if (inline) {
       for (let i = 1; i < words.length; i++) {
         const t = words[i]!.text;
@@ -711,7 +855,13 @@ function expand(input: Word[], redirs: Segment['redirects'], dialect: Dialect, d
     }
   };
 
-  for (let guard = 0; guard < 16 && ws.length; guard++) {
+  for (let guard = 0; ws.length; guard++) {
+    // `sudo sudo sudo … rm x`: past this many wrappers the rest is left to the keyword checks
+    if (guard >= 16) {
+      out.problems.push('wrapped too deeply');
+      out.opaque.push({ text: joined(ws), why: 'wrapped too deeply' });
+      break;
+    }
     const head = ws[0]!;
     if (head.dynamic) break;
     const prog = programName(head.text);
@@ -789,6 +939,42 @@ function expand(input: Word[], redirs: Segment['redirects'], dialect: Dialect, d
         ws = ws.slice(skipFlags(ws, 1, VALUE_FLAGS.npx));
         continue;
       }
+      // `busybox rm x`, `toybox rm x`: the applet is the program
+      case 'busybox':
+      case 'toybox': {
+        if (!rest.length || rest[0]!.text.startsWith('-')) return emit(ws);
+        ws = rest;
+        continue;
+      }
+      // `trap 'rm -rf dist' EXIT`: the action runs later in this shell
+      case 'trap': {
+        const action = rest.find(w => !w.text.startsWith('-'));
+        if (action && action.text !== '' && action.text !== '-') sub(action.text, dialect === 'cmd' ? 'posix' : dialect, 'trap');
+        return emit(ws);
+      }
+      // Python runners: `uv run python -c …`, `uvx tool`, `poetry run …`, `pipenv run …`, `pdm run …`, `hatch run …`
+      case 'uv': {
+        if (rest[0]?.text !== 'run' && rest[0]?.text !== 'tool') return emit(ws);
+        const from = rest[0]?.text === 'tool' ? (rest[1]?.text === 'run' ? 3 : -1) : 2;
+        if (from < 0) return emit(ws);
+        ws = ws.slice(skipFlags(ws, from, UV_VALUE_FLAGS));
+        continue;
+      }
+      case 'uvx':
+      case 'pipx': {
+        if (prog === 'pipx' && rest[0]?.text !== 'run') return emit(ws);
+        ws = ws.slice(skipFlags(ws, prog === 'pipx' ? 2 : 1, UV_VALUE_FLAGS));
+        continue;
+      }
+      case 'poetry':
+      case 'pipenv':
+      case 'pdm':
+      case 'hatch':
+      case 'rye': {
+        if (rest[0]?.text !== 'run') return emit(ws);
+        ws = ws.slice(skipFlags(ws, 2, UV_VALUE_FLAGS));
+        continue;
+      }
       case 'npm':
       case 'pnpm':
       case 'yarn':
@@ -807,12 +993,7 @@ function expand(input: Word[], redirs: Segment['redirects'], dialect: Dialect, d
       case 'ksh':
       case 'mksh':
       case 'ash':
-      case 'fish':
-      case 'busybox': {
-        if (prog === 'busybox' && rest[0] && ['sh', 'ash', 'bash'].includes(rest[0].text)) {
-          ws = rest;
-          continue;
-        }
+      case 'fish': {
         for (let i = 1; i < ws.length; i++) {
           const t = ws[i]!.text;
           if (t === '-o' || t === '+o' || t === '-O' || t === '+O' || t === '--rcfile' || t === '--init-file') {

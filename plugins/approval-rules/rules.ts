@@ -2,7 +2,7 @@
 // access level. Pure: it reads a permission hook payload and a configuration and returns a verdict, with no
 // dependency on Acpira, so the test suite drives it directly.
 
-import { analyze, type Command, programName, quoteArgv } from './shell';
+import { analyze, type Command, OutOfTime, programName, quoteArgv } from './shell';
 
 export type Action = 'ask' | 'deny';
 
@@ -21,12 +21,14 @@ export const BUILTIN = {
   'repo-delete': { description: '刪除 repo', high: true },
   unparsed: { description: '指令無法完整解析，且含有危險關鍵字', high: false },
   'self-config': { description: '修改 approval-rules 自己的設定', high: false },
+  unreadable: { description: '無法判斷要執行什麼或寫到哪裡（指令過長或太複雜、判斷逾時、執行請求沒有指令，或切換到無法判斷的目錄後寫檔）', high: false },
 } as const;
 
 export type BuiltinId = keyof typeof BUILTIN;
 
-// Rules a user setting cannot switch off: the plugin's own configuration stays behind a card
-const LOCKED: ReadonlySet<BuiltinId> = new Set(['self-config']);
+// Rules a user setting cannot switch off: the plugin's own configuration stays behind a card, and so does what could
+// not be judged at all (otherwise a long or slow command would pass)
+const LOCKED: ReadonlySet<BuiltinId> = new Set(['self-config', 'unreadable']);
 
 export const DEFAULT_CONFIG_FILES: readonly string[] = [
   // Secrets and environment
@@ -48,8 +50,15 @@ export const DEFAULT_CONFIG_FILES: readonly string[] = [
   '.cursorrules', '.windsurfrules', '.mcp.json', '.vscode/**', '.idea/**', '.acpira/**',
 ];
 
-// Paths of the plugin's own settings (the data folder's config and every project's file)
-const SELF_FILES: readonly string[] = ['plugins/.data/approval-rules/**', '.agents/approval-rules.json'];
+// Paths of the plugin's own settings and code: the data folder, every project's file, the installed plugin and its
+// kept versions, and Acpira's record of which plugins are enabled
+const SELF_FILES: readonly string[] = [
+  'plugins/.data/approval-rules/**',
+  '.agents/approval-rules.json',
+  'plugins/state.json',
+  'plugins/.versions/approval-rules/**',
+  'plugins/approval-rules/**',
+];
 
 export interface CustomRule {
   id: string;
@@ -58,7 +67,7 @@ export interface CustomRule {
   // Program then words that must follow it in order (flags in between are ignored): ["terraform", "apply"]
   command?: string[];
   // File globs: an edit, a deletion or a shell write of a matching file
-  paths?: RegExp[];
+  paths?: Glob[];
   // A regular expression on each command line (user configuration only)
   pattern?: RegExp;
   source: 'user' | 'project';
@@ -72,8 +81,8 @@ export interface RuleSetting {
 export interface Config {
   rules: Record<BuiltinId, RuleSetting>;
   configFiles: string[];
-  configMatchers: RegExp[];
-  selfMatchers: RegExp[];
+  configMatchers: Glob[];
+  selfMatchers: Glob[];
   // Remote names `git push` may name without the foreign-repo rule (lowercase)
   allowedRemotes: string[];
   // owner/repo pairs gh may write to and pushes by URL may target (lowercase)
@@ -97,59 +106,158 @@ export interface Verdict {
   reason: string;
 }
 
-// Globs: `**` any depth, `*` and `?` within a segment, `{a,b}` alternatives; a pattern matches at any depth, case-insensitively
-export function globToRegExp(glob: string): RegExp {
-  let g = glob.trim().replace(/\\/g, '/');
-  if (g.endsWith('/')) g += '**';
-  g = g.replace(/^(\.\/)+/, '').replace(/^\/+/, '').replace(/(\*\*\/)+/g, '**/');
-  let re = '';
-  for (let i = 0; i < g.length; i++) {
-    const c = g[i]!;
-    if (c === '*') {
-      if (g[i + 1] === '*') {
-        if (g[i + 2] === '/') {
-          re += '(?:[^/]*/)*';
-          i += 2;
-        } else {
-          re += '.*';
-          i += 1;
-        }
-      } else re += '[^/]*';
-    } else if (c === '?') re += '[^/]';
-    else if (c === '{') {
-      const end = g.indexOf('}', i);
-      if (end < 0) re += '\\{';
-      else {
-        re += `(?:${g.slice(i + 1, end).split(',').map(escape).join('|')})`;
-        i = end;
+// Globs: `**` any depth, `*` and `?` within a segment, `{a,b}` alternatives; a pattern matches at any depth,
+// case-insensitively, and `dir/**` also names the folder itself. Matched without regular expressions, segment by
+// segment, so a pattern from a project file cannot make a match slow.
+export interface Glob {
+  source: string;
+  test(path: string): boolean;
+}
+
+const MAX_GLOB_LENGTH = 300;
+const MAX_GLOB_STARS = 16;
+const MAX_GLOB_ALTERNATIVES = 32;
+export const MAX_PATH_LENGTH = 4096;
+
+// Every alternative of `{a,b}` groups (not nested), or null past the limit
+function braces(g: string): string[] | null {
+  let out = [g];
+  for (let round = 0; round < MAX_GLOB_ALTERNATIVES; round++) {
+    const next: string[] = [];
+    let changed = false;
+    for (const s of out) {
+      const open = s.indexOf('{');
+      const close = open < 0 ? -1 : s.indexOf('}', open);
+      if (close < 0) {
+        next.push(s);
+        continue;
       }
-    } else re += escape(c);
+      changed = true;
+      for (const alt of s.slice(open + 1, close).split(',')) next.push(s.slice(0, open) + alt + s.slice(close + 1));
+    }
+    if (next.length > MAX_GLOB_ALTERNATIVES) return null;
+    out = next;
+    if (!changed) return out;
   }
-  // `dir/**` also names the folder itself
-  if (re.endsWith('/.*')) re = `${re.slice(0, -3)}(?:/.*)?`;
-  return new RegExp(`(?:^|/)${re}$`, 'i');
+  return null;
 }
 
-function escape(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// One segment against one pattern segment (`*` and `?` only): the usual two-pointer match, O(len × len) at worst
+function segmentMatch(pat: string, s: string): boolean {
+  let p = 0;
+  let i = 0;
+  let star = -1;
+  let mark = 0;
+  while (i < s.length) {
+    if (p < pat.length && (pat[p] === '?' || pat[p] === s[i])) {
+      p++;
+      i++;
+    } else if (p < pat.length && pat[p] === '*') {
+      star = p++;
+      mark = i;
+    } else if (star >= 0) {
+      p = star + 1;
+      i = ++mark;
+    } else return false;
+  }
+  while (p < pat.length && pat[p] === '*') p++;
+  return p === pat.length;
 }
 
+// Pattern segments (`**` for any number of segments) against path segments; memoised, so O(segments × segments)
+function segmentsMatch(pat: string[], path: string[]): boolean {
+  const memo = new Map<number, boolean>();
+  const go = (pi: number, si: number): boolean => {
+    const key = pi * (path.length + 1) + si;
+    const known = memo.get(key);
+    if (known !== undefined) return known;
+    let r: boolean;
+    if (pi === pat.length) r = si === path.length;
+    else if (pat[pi] === '**') r = go(pi + 1, si) || (si < path.length && go(pi, si + 1));
+    else r = si < path.length && segmentMatch(pat[pi]!, path[si]!) && go(pi + 1, si + 1);
+    memo.set(key, r);
+    return r;
+  };
+  return go(0, 0);
+}
+
+// null when the glob is too long or has too many wildcards or alternatives
+export function compileGlob(glob: string): Glob | null {
+  let g = glob.trim().replace(/\\/g, '/').toLowerCase();
+  if (!g || g.length > MAX_GLOB_LENGTH) return null;
+  if ((g.match(/\*/g) ?? []).length > MAX_GLOB_STARS) return null;
+  if (g.endsWith('/')) g += '**';
+  g = g.replace(/^(\.\/)+/, '').replace(/^\/+/, '');
+  const alts = braces(g);
+  if (!alts) return null;
+  const patterns = alts.map(a => {
+    const segs = a.split('/').filter(s => s !== '' && s !== '.');
+    // `a**b` is `a*b`; `**` alone spans folders; a pattern matches at any depth
+    const norm = segs.map(s => (s === '**' ? s : s.replace(/\*\*+/g, '*')));
+    const out = ['**'];
+    for (const s of norm) if (!(s === '**' && out[out.length - 1] === '**')) out.push(s);
+    return out;
+  });
+  return {
+    source: glob,
+    test(path: string): boolean {
+      const segs = pathSegments(path);
+      return patterns.some(p => segmentsMatch(p, segs));
+    },
+  };
+}
+
+// A path as Windows and POSIX would both resolve it: `\` and `/` alike, `//`, `/./` and `x/..` folded, trailing dots
+// and spaces of a name dropped (Windows ignores them), `::$DATA` (the main stream) dropped; lowercase
 export function normalizePath(p: string): string {
-  return p.replace(/\\/g, '/').replace(/\/+$/, '');
+  const parts = p.replace(/\\/g, '/').split('/');
+  const out: string[] = [];
+  const absolute = parts[0] === '' && parts.length > 1;
+  for (let i = 0; i < parts.length; i++) {
+    let s = parts[i]!;
+    if (i === parts.length - 1) s = s.replace(/::\$data$/i, '');
+    if (s !== '.' && s !== '..') s = s.replace(/[. ]+$/, '');
+    if (s === '' || s === '.') continue;
+    if (s === '..') {
+      const top = out[out.length - 1];
+      const drive = top !== undefined && /^[A-Za-z]:$/.test(top);
+      if (top !== undefined && top !== '..' && top !== '~' && !drive) {
+        out.pop();
+        continue;
+      }
+      // Nothing above a root or a drive
+      if (drive || (absolute && top === undefined)) continue;
+    }
+    out.push(s);
+  }
+  return (absolute ? '/' : '') + out.join('/');
 }
 
-function matchesAny(path: string, res: RegExp[]): boolean {
-  const p = normalizePath(path);
-  return res.some(r => r.test(p));
+function pathSegments(path: string): string[] {
+  return normalizePath(path).toLowerCase().split('/').filter(Boolean);
 }
 
-// `owner/repo` from a slug, `host/owner/repo`, an https or ssh URL; lowercase, without `.git`
+// A Windows 8.3 short name (`GITHUB~1`, `PACKAG~1.JSO`): which long name it stands for cannot be known here
+export const shortName = (path: string) => pathSegments(path).some(s => /^[^~]{1,6}~\d+(\.[^.]{0,3})?$/.test(s));
+
+function matchesAny(path: string, globs: Glob[]): boolean {
+  return globs.some(g => g.test(path));
+}
+
+// `host/owner/repo` (github.com when no host is given) from a slug, `host/owner/repo`, an https or ssh URL;
+// lowercase, without `.git`
 export function normalizeRepo(s: string): string {
   let r = s.trim().toLowerCase();
+  const url = /^[a-z+]+:\/\//.test(r);
   r = r.replace(/^[a-z+]+:\/\//, '').replace(/^[^@/]+@/, '').replace(/\.git$/, '').replace(/\/+$/, '');
-  r = r.replace(':', '/');
+  // scp-like `host:owner/repo`, or `host:port/owner/repo` in a URL
+  if (url) r = r.replace(/^([^/:]+):\d+\//, '$1/');
+  else r = r.replace(/^([^/:]+):/, '$1/');
   const parts = r.split('/').filter(Boolean);
-  return parts.slice(-2).join('/');
+  if (parts.length < 2) return parts.join('/');
+  const [owner, repo] = parts.slice(-2);
+  const host = parts.length >= 3 ? parts[0] : 'github.com';
+  return `${host}/${owner}/${repo}`;
 }
 
 const isUrl = (s: string) => /^[a-z+]+:\/\//i.test(s) || /^[^@\s]+@[^:\s]+:/.test(s) || s.includes('/');
@@ -165,9 +273,21 @@ function defaults(): Record<BuiltinId, RuleSetting> {
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim() !== '') : []);
 const MAX_PATTERNS = 200;
-const MAX_PATTERN_LENGTH = 300;
+// Globs a project file may add in all (configFiles.add and every custom rule's paths)
+const MAX_PROJECT_GLOBS = 500;
 
-function compileCustom(raw: unknown, source: 'user' | 'project', index: number, warnings: string[]): CustomRule | null {
+// Globs that compile; the others are reported
+function globs(list: string[], where: string, warnings: string[]): Glob[] {
+  const out: Glob[] = [];
+  for (const p of list) {
+    const g = compileGlob(p);
+    if (g) out.push(g);
+    else warnings.push(`${where}：${p.length > 60 ? `${p.slice(0, 59)}…` : p} 太長，或 * 超過 ${MAX_GLOB_STARS} 個、{a,b} 組合超過 ${MAX_GLOB_ALTERNATIVES} 種，已略過`);
+  }
+  return out;
+}
+
+function compileCustom(raw: unknown, source: 'user' | 'project', index: number, warnings: string[], budget: { globs: number }): CustomRule | null {
   const where = `${source === 'user' ? '使用者' : '專案'}設定 custom[${index}]`;
   if (!isObject(raw)) {
     warnings.push(`${where} 不是物件，已略過`);
@@ -178,8 +298,14 @@ function compileCustom(raw: unknown, source: 'user' | 'project', index: number, 
   const rule: CustomRule = { id: source === 'project' ? `project:${id}` : `custom:${id}`, description: typeof raw.description === 'string' && raw.description ? raw.description : id, action, source };
   const command = strings(raw.command);
   if (command.length) rule.command = [programName(command[0]!), ...command.slice(1).map(w => w.toLowerCase())];
-  const paths = strings(raw.paths).slice(0, MAX_PATTERNS).filter(p => p.length <= MAX_PATTERN_LENGTH);
-  if (paths.length) rule.paths = paths.map(globToRegExp);
+  let paths = strings(raw.paths).slice(0, MAX_PATTERNS);
+  if (paths.length > budget.globs) {
+    warnings.push(`${where}：專案設定的 glob 總數超過 ${MAX_PROJECT_GLOBS}，多的已略過`);
+    paths = paths.slice(0, Math.max(0, budget.globs));
+  }
+  budget.globs -= paths.length;
+  const compiled = globs(paths, where, warnings);
+  if (compiled.length) rule.paths = compiled;
   if (typeof raw.pattern === 'string' && raw.pattern) {
     if (source === 'project') warnings.push(`${where}：專案設定不接受 pattern（正規表示式），已略過這個欄位`);
     else {
@@ -210,6 +336,8 @@ export function resolveConfig(user: unknown, project: unknown): { config: Config
   let allowedRepos: string[] = [];
   const custom: CustomRule[] = [];
   let toast = true;
+  const projectBudget = { globs: MAX_PROJECT_GLOBS };
+  let projectConfigFiles: string[] = [];
 
   if (user !== undefined && user !== null) {
     if (!isObject(user)) warnings.push('使用者設定不是 JSON 物件，改用預設規則');
@@ -220,7 +348,7 @@ export function resolveConfig(user: unknown, project: unknown): { config: Config
       for (const id of Object.keys(BUILTIN) as BuiltinId[]) if (BUILTIN[id].high) rules[id].action = high;
       if (isObject(user.rules)) {
         for (const [id, v] of Object.entries(user.rules)) {
-          if (!(id in BUILTIN)) {
+          if (!Object.hasOwn(BUILTIN, id)) {
             warnings.push(`rules.${id} 不是內建規則`);
             continue;
           }
@@ -245,7 +373,7 @@ export function resolveConfig(user: unknown, project: unknown): { config: Config
       }
       if (Array.isArray(user.allowedRemotes)) allowedRemotes = strings(user.allowedRemotes).map(r => r.toLowerCase());
       if (Array.isArray(user.allowedRepos)) allowedRepos = strings(user.allowedRepos).map(normalizeRepo);
-      if (Array.isArray(user.custom)) user.custom.forEach((r, i) => { const c = compileCustom(r, 'user', i, warnings); if (c) custom.push(c); });
+      if (Array.isArray(user.custom)) user.custom.forEach((r, i) => { const c = compileCustom(r, 'user', i, warnings, { globs: Infinity }); if (c) custom.push(c); });
       if (user.toast === false) toast = false;
     }
   }
@@ -258,20 +386,23 @@ export function resolveConfig(user: unknown, project: unknown): { config: Config
       }
       if (isObject(project.configFiles)) {
         for (const k of Object.keys(project.configFiles)) if (k !== 'add') warnings.push(`專案設定的 configFiles.${k} 不會生效：只能用 add`);
-        configFiles.push(...strings(project.configFiles.add).slice(0, MAX_PATTERNS).filter(p => p.length <= MAX_PATTERN_LENGTH));
+        projectConfigFiles = strings(project.configFiles.add).slice(0, Math.min(MAX_PATTERNS, projectBudget.globs));
+        projectBudget.globs -= projectConfigFiles.length;
       }
       if (Array.isArray(project.custom)) {
-        project.custom.slice(0, MAX_PATTERNS).forEach((r, i) => { const c = compileCustom(r, 'project', i, warnings); if (c) custom.push(c); });
+        project.custom.slice(0, MAX_PATTERNS).forEach((r, i) => { const c = compileCustom(r, 'project', i, warnings, projectBudget); if (c) custom.push(c); });
       }
     }
   }
 
+  const configMatchers = [...globs(configFiles, '使用者設定 configFiles', warnings), ...globs(projectConfigFiles, '專案設定 configFiles.add', warnings)];
+  configFiles = [...configFiles, ...projectConfigFiles];
   return {
     config: {
       rules,
       configFiles,
-      configMatchers: configFiles.map(globToRegExp),
-      selfMatchers: SELF_FILES.map(globToRegExp),
+      configMatchers,
+      selfMatchers: SELF_FILES.map(p => compileGlob(p)!),
       allowedRemotes,
       allowedRepos,
       custom,
@@ -285,16 +416,30 @@ export function resolveConfig(user: unknown, project: unknown): { config: Config
 
 export interface Request {
   kind?: string;
+  // The request runs a command (its kind, or the tool row's kind, is execute)
+  execute: boolean;
   // Command lines to read (rawInput, the tool row's target, backquoted parts of the title)
   commands: string[];
   // Files an edit-like tool would change
   paths: string[];
+  // The session's folder, which relative paths are resolved against
+  cwd?: string;
 }
 
 const PATH_KEYS = ['path', 'file_path', 'filePath', 'filepath', 'notebook_path', 'target_file', 'source', 'destination', 'old_path', 'new_path', 'oldPath', 'newPath'];
-const COMMAND_KEYS = ['command', 'cmd', 'CommandLine', 'commandLine'];
+// A command line, or an argv array
+const COMMAND_KEYS = ['command', 'cmd', 'CommandLine', 'commandLine', 'script'];
 // Kinds whose paths are read, never written
 const READING = new Set(['read', 'search', 'fetch', 'think', 'execute', 'switch_mode']);
+
+const allStrings = (v: unknown): v is string[] => Array.isArray(v) && v.length > 0 && v.every(x => typeof x === 'string');
+
+// A command line (string) or an argv (array of strings) as one line to read
+function commandLine(v: unknown, out: Set<string>): void {
+  if (typeof v === 'string') {
+    if (v.trim()) out.add(v);
+  } else if (allStrings(v)) out.add(quoteArgv(v));
+}
 
 export function extractRequest(payload: unknown): Request {
   const p = isObject(payload) ? payload : {};
@@ -302,14 +447,24 @@ export function extractRequest(payload: unknown): Request {
   const row = isObject(p.row) ? p.row : {};
   const raw = isObject(tc.rawInput) ? tc.rawInput : {};
   const kind = typeof tc.kind === 'string' ? tc.kind : typeof row.kind === 'string' ? row.kind : undefined;
+  // The tool call's kind and the row's may disagree (`other` in one, `execute` in the other): either one counts
+  const execute = tc.kind === 'execute' || row.kind === 'execute';
   const commands = new Set<string>();
-  for (const k of COMMAND_KEYS) {
+  for (const k of COMMAND_KEYS) commandLine(raw[k], commands);
+  // `commands: ["git push", ["rm", "-rf", "x"]]`: each entry is a line or an argv
+  if (Array.isArray(raw.commands)) for (const c of raw.commands) commandLine(c, commands);
+  // `{ command: "git", args: ["push"] }`
+  const program = typeof raw.command === 'string' ? raw.command : typeof raw.cmd === 'string' ? raw.cmd : undefined;
+  for (const k of ['args', 'argv', 'arguments']) {
     const v = raw[k];
-    if (typeof v === 'string' && v.trim()) commands.add(v);
-    else if (Array.isArray(v) && v.length && v.every(x => typeof x === 'string')) commands.add(quoteArgv(v as string[]));
+    if (allStrings(v)) {
+      if (program) commands.add(`${program} ${quoteArgv(v)}`);
+      else if (execute) commands.add(quoteArgv(v));
+    } else if (typeof v === 'string' && v.trim() && (program || execute)) commands.add(program ? `${program} ${v}` : v);
   }
-  if (kind === 'execute' && typeof row.target === 'string' && row.target.trim()) commands.add(row.target);
-  if (kind === 'execute' || kind === undefined) {
+  if (execute && typeof raw.input === 'string' && raw.input.trim()) commands.add(raw.input);
+  if (execute && typeof row.target === 'string' && row.target.trim()) commands.add(row.target);
+  if (execute || kind === undefined) {
     for (const title of [tc.title]) {
       if (typeof title !== 'string') continue;
       // claude-agent-acp titles a shell call as the command in backquotes, with inner backquotes escaped
@@ -335,20 +490,121 @@ export function extractRequest(payload: unknown): Request {
   if (Array.isArray(tc.content)) {
     for (const c of tc.content) if (isObject(c) && c.type === 'diff' && typeof c.path === 'string' && c.path) paths.add(c.path);
   }
-  return { kind, commands: [...commands], paths: [...paths] };
+  const cwd = typeof p.cwd === 'string' && p.cwd ? p.cwd : undefined;
+  return { kind, execute, commands: [...commands], paths: [...paths], cwd };
 }
 
-// Keyword checks for what could not be read
+// Keyword checks for what could not be read. One pass over the words, no regular expression on the whole text, so
+// the time grows with the length and nothing else.
 
-const KEYWORDS: { re: RegExp; what: string }[] = [
-  { re: /\b(rm|rmdir|unlink|shred|del|erase|rd|remove-item|rimraf|rmtree|rmsync|rmdirsync|unlinksync|os\.remove|deletefile|deletedirectory)\b/i, what: '刪除' },
-  { re: /\bgit\b[\s\S]*\b(push|rm|clean|reset|checkout|restore|stash|branch|worktree|config|remote|update-ref)\b/i, what: 'git 寫入' },
-  { re: /\bgh\b[\s\S]*\b(merge|delete|create|edit|close|api|repo)\b/i, what: 'gh 寫入' },
-  { re: /--force\b|--force-with-lease|--mirror\b/i, what: '強制' },
-];
+const DELETE_WORDS = new Set([
+  'rm', 'rmdir', 'unlink', 'shred', 'del', 'erase', 'rd', 'remove-item', 'rimraf', 'rmtree', 'rmsync', 'rmdirsync',
+  'unlinksync', 'deletefile', 'deletedirectory', 'rm_rf', 'rm_r', 'rm_f', 'remove_dir', 'remove_entry', 'removesync',
+  'removedirs', 'remove_file', 'remove_dir_all',
+]);
+// `remove` / `delete` mean a deletion only as a method of these: os.remove, File.delete, Deno.remove, [IO.File]::Delete
+const DELETE_OWNERS = new Set(['os', 'fs', 'fsp', 'fse', 'promises', 'shutil', 'file', 'fileutils', 'dir', 'directory', 'fileinfo', 'directoryinfo', 'deno', 'path', 'pathlib', 'io', 'bun', 'filesystem']);
+const OWNED_DELETES = new Set(['remove', 'delete', 'delete_all']);
+const GIT_WORDS = new Set(['push', 'rm', 'clean', 'reset', 'checkout', 'restore', 'stash', 'branch', 'worktree', 'config', 'remote', 'update-ref', 'tag', 'merge', 'switch', 'filter-branch', 'filter-repo']);
+const GH_WORDS = new Set(['merge', 'delete', 'create', 'edit', 'close', 'api', 'repo', 'alias']);
 
-function keywords(text: string): string[] {
-  return KEYWORDS.filter(k => k.re.test(text)).map(k => k.what);
+interface CodeWord {
+  // The word as written, lowercase, without .exe / .cmd / .bat / .com / .ps1
+  word: string;
+  // Its dotted parts, joined to the word before when it is a method call (`[IO.File]::Delete`, `Path(p).unlink`)
+  parts: string[];
+}
+
+function codeWords(text: string): CodeWord[] {
+  const out: CodeWord[] = [];
+  let prev = '';
+  for (const raw of text.toLowerCase().split(/[^a-z0-9_.:\-]+/)) {
+    if (!raw) continue;
+    const word = raw.replace(/\.(exe|cmd|bat|com|ps1)$/, '');
+    const call = word.startsWith('.') || word.startsWith(':') ? prev + word : word;
+    prev = word;
+    out.push({ word, parts: call.replace(/::/g, '.').split('.').filter(Boolean) });
+  }
+  return out;
+}
+
+export function keywords(text: string): string[] {
+  let del = false;
+  let gitWrite = false;
+  let ghWrite = false;
+  let force = false;
+  let git = false;
+  let gh = false;
+  for (const { word, parts } of codeWords(text)) {
+    const last = parts[parts.length - 1] ?? '';
+    const owner = parts.length > 1 ? parts[parts.length - 2]! : '';
+    if (DELETE_WORDS.has(word) || DELETE_WORDS.has(last) || (OWNED_DELETES.has(last) && DELETE_OWNERS.has(owner))) del = true;
+    if (word.startsWith('--force') || word === '--mirror') force = true;
+    if (git && GIT_WORDS.has(word)) gitWrite = true;
+    if (gh && GH_WORDS.has(word)) ghWrite = true;
+    if (last === 'git' || word === 'git') git = true;
+    if (last === 'gh' || word === 'gh') gh = true;
+  }
+  const out: string[] = [];
+  if (del) out.push('刪除');
+  if (gitWrite) out.push('git 寫入');
+  if (ghWrite) out.push('gh 寫入');
+  if (force) out.push('強制');
+  return out;
+}
+
+// Inline code that writes a file named in a string literal: `node -e "fs.writeFileSync('package.json', …)"`,
+// `python -c "open('.env', 'w')"`
+
+const WRITE_CALLS = new Set([
+  'writefile', 'writefilesync', 'appendfile', 'appendfilesync', 'createwritestream', 'copyfile', 'copyfilesync',
+  'cpsync', 'renamesync', 'symlinksync', 'linksync', 'writetextfile', 'writetextfilesync', 'write_text', 'write_bytes',
+  'copy2', 'copytree', 'binwrite', 'writealltext', 'writeallbytes', 'writealllines', 'appendalltext', 'appendalllines',
+  'set-content', 'add-content', 'out-file', 'copy-item', 'move-item', 'new-item', 'outputfile', 'outputfilesync',
+  'outputjson', 'writejson', 'writejsonsync',
+]);
+// Generic names that write only as a method of a file module: File.write, fs.cp, shutil.copy, os.replace, Bun.write
+const OWNED_WRITES = new Set(['write', 'cp', 'mv', 'copy', 'move', 'rename', 'replace', 'symlink', 'link', 'touch']);
+const WRITE_OWNERS = new Set([...DELETE_OWNERS, 'shutil', 'os']);
+const OPEN_MODE = /^[rwax][bt+]*$/;
+
+// The contents of the quoted strings in code (one pass; backslash escapes honoured)
+function literals(text: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const q = text[i];
+    if (q !== '"' && q !== "'" && q !== '`') continue;
+    let j = i + 1;
+    let s = '';
+    while (j < text.length && text[j] !== q && text[j] !== '\n') {
+      if (text[j] === '\\' && j + 1 < text.length) {
+        s += text[j + 1];
+        j += 2;
+        continue;
+      }
+      s += text[j];
+      j++;
+    }
+    if (j < text.length && text[j] === q && s.length <= 1024) out.push(s);
+    i = j;
+  }
+  return out;
+}
+
+function inlineWrites(ctx: Ctx, text: string): void {
+  const ws = codeWords(text);
+  const lits = literals(text);
+  const last = (w: CodeWord) => w.parts[w.parts.length - 1] ?? '';
+  const owner = (w: CodeWord) => (w.parts.length > 1 ? w.parts[w.parts.length - 2]! : '');
+  const writes =
+    ws.some(w => WRITE_CALLS.has(last(w)) || WRITE_CALLS.has(w.word) || (OWNED_WRITES.has(last(w)) && WRITE_OWNERS.has(owner(w)))) ||
+    // open('x', 'w'), File.open('x', 'w'), fopen('x', 'a')
+    (ws.some(w => ['open', 'fopen'].includes(last(w))) && lits.some(l => OPEN_MODE.test(l) && /[wax+]/.test(l)));
+  if (!writes) return;
+  for (const l of new Set(lits)) {
+    if (!l.trim() || l.length > MAX_PATH_LENGTH) continue;
+    checkPath(ctx, l, l, 'write', `${clip(text)}（程式碼寫入 ${l}）`);
+  }
 }
 
 // Commands
@@ -356,6 +612,14 @@ function keywords(text: string): string[] {
 interface Ctx {
   config: Config;
   hits: Hit[];
+  // Date.now() past which the judging gives up and asks
+  deadline: number;
+  // The session's folder
+  cwd?: string;
+}
+
+function tick(ctx: Ctx): void {
+  if (Date.now() > ctx.deadline) throw new OutOfTime();
 }
 
 function add(ctx: Ctx, rule: BuiltinId, detail: string): void {
@@ -363,6 +627,32 @@ function add(ctx: Ctx, rule: BuiltinId, detail: string): void {
   if (!s.enabled) return;
   if (ctx.hits.some(h => h.rule === rule && h.detail === detail)) return;
   ctx.hits.push({ rule, description: BUILTIN[rule].description, action: s.action, high: BUILTIN[rule].high, detail });
+}
+
+// Where a target written on a command line points: absolute (or rooted in a variable, `$HOME/x`, `%APPDATA%\x`, whose
+// tail is still matched) as it is, relative under the folder the command runs in; null when that folder is unknown
+const ROOTED = /^(\/|~|[A-Za-z]:|\\\\|\$|%)/;
+function resolve(target: string, dir: string | null, base: string | undefined): string | null {
+  const t = target.replace(/\\/g, '/');
+  if (ROOTED.test(t)) return t;
+  if (dir === null) return null;
+  const d = dir.replace(/\\/g, '/');
+  const prefix = ROOTED.test(d) ? d : [base?.replace(/\\/g, '/'), d].filter(Boolean).join('/');
+  return prefix ? `${prefix}/${t}` : t;
+}
+
+// The configuration, self and custom path rules for one file a tool or command writes or deletes. `local` is the
+// path without the session folder in front, for the short-name check (the session folder itself may be a short name).
+function checkPath(ctx: Ctx, path: string, local: string, op: 'write' | 'delete', detail: string): void {
+  tick(ctx);
+  if (path.length > MAX_PATH_LENGTH) {
+    add(ctx, 'unreadable', `${detail}（路徑超過 ${MAX_PATH_LENGTH} 字元）`);
+    return;
+  }
+  if (shortName(local)) add(ctx, 'unreadable', `${detail}（路徑用了 8.3 短檔名，無法判斷原本的名稱）`);
+  if (matchesAny(path, ctx.config.selfMatchers)) add(ctx, 'self-config', detail);
+  if (op === 'write' && matchesAny(path, ctx.config.configMatchers)) add(ctx, 'config-files', detail);
+  for (const r of ctx.config.custom) if (r.paths && matchesAny(path, r.paths)) addCustom(ctx, r, detail);
 }
 
 const clip = (s: string, n = 160) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -493,6 +783,10 @@ function gitPush(ctx: Ctx, args: string[], text: string): void {
   }
 }
 
+// An operand of `git checkout` that names files rather than a branch: `.`, `./x`, `a\b`, a glob, or a name with a file
+// extension (`a.ts`, `package.json`; a version tag such as v1.2.3 ends in a digit and passes)
+const pathLike = (a: string) => a === '.' || a.startsWith('./') || a.startsWith('../') || a.includes('\\') || a.includes('*') || /\.[A-Za-z][A-Za-z0-9]{0,7}$/.test(a);
+
 function git(ctx: Ctx, cmd: Command): void {
   const { sub, args, alias } = gitParts(cmd.argv);
   const text = cmd.text;
@@ -513,10 +807,19 @@ function git(ctx: Ctx, cmd: Command): void {
       if (!has('--dry-run') && !cluster('n')) add(ctx, 'git-discard', text);
       return;
     case 'reset':
-      if (has('--hard', '--merge')) add(ctx, 'git-discard', text);
+      if (has('--hard', '--merge', '--keep')) add(ctx, 'git-discard', text);
       return;
-    case 'checkout':
-      if (has('--', '--force', '--ours', '--theirs', '--patch') || cluster('f') || cluster('p') || positionals(['', ...args]).includes('.')) add(ctx, 'git-discard', text);
+    case 'checkout': {
+      // `git checkout src/a.ts` restores the file; `-B` resets an existing branch. A branch or tag name passes.
+      const operands = positionals(['', ...args]);
+      if (has('--', '--force', '--ours', '--theirs', '--patch') || cluster('f') || cluster('p') || cluster('B') || operands.some(pathLike)) add(ctx, 'git-discard', text);
+      return;
+    }
+    case 'tag':
+      if (has('--delete') || cluster('d')) add(ctx, 'branch-delete', text);
+      return;
+    case 'merge':
+      if (has('--squash')) add(ctx, 'merge-squash', text);
       return;
     case 'restore': {
       const staged = has('--staged') || cluster('S');
@@ -525,7 +828,7 @@ function git(ctx: Ctx, cmd: Command): void {
       return;
     }
     case 'switch':
-      if (has('--discard-changes', '--force') || cluster('f')) add(ctx, 'git-discard', text);
+      if (has('--discard-changes', '--force', '--force-create') || cluster('f') || cluster('C')) add(ctx, 'git-discard', text);
       return;
     case 'stash': {
       const verb = positionals(['', ...args])[0];
@@ -580,13 +883,52 @@ const GH_WRITES: Record<string, string[]> = {
 };
 const GH_VALUE_FLAGS = new Set(['-R', '--repo', '-X', '--method', '-H', '--header', '-f', '-F', '--field', '--raw-field', '--input', '-t', '--title', '-b', '--body', '-B', '--base', '--head', '-m', '--milestone', '-a', '--assignee', '-l', '--label', '-r', '--reviewer', '--subject', '--body-file', '-q', '--jq', '--template', '-p', '--project', '--match-head-commit', '-A', '--author-email', '--hostname', '--cache']);
 
+// gh's command groups; anything else is an alias (`gh alias set`) or an extension whose effect is unknown
+const GH_GROUPS = new Set([
+  'agent-task', 'alias', 'api', 'attestation', 'auth', 'browse', 'cache', 'co', 'codespace', 'cs', 'completion', 'config',
+  'copilot', 'extension', 'extensions', 'ext', 'gist', 'gpg-key', 'help', 'issue', 'label', 'org', 'pr', 'preview',
+  'project', 'release', 'repo', 'ruleset', 'rs', 'run', 'search', 'secret', 'ssh-key', 'status', 'variable', 'workflow',
+  'version', 'accessibility', 'a11y', 'licenses',
+]);
+
+// A write to the GitHub REST or GraphQL API (`gh api`, curl and the like): which repository, and merges, deletions
+// and auto-merge it would do. `body` is the request's fields or data; `unknownBody` when they come from a file.
+function githubApi(ctx: Ctx, method: string, path: string, body: string, unknownBody: boolean, host: string, text: string, tool: string): void {
+  const endpoint = path.replace(/^\/+/, '').split(/[?#]/)[0]!;
+  if (endpoint === 'graphql' || endpoint === 'api/graphql') {
+    // A query reads; a mutation, or a body the command line does not show, may write
+    if (!unknownBody && !/\bmutation\b/i.test(body)) return;
+    add(ctx, 'foreign-repo', `${text}（GraphQL ${unknownBody ? '內容在檔案裡' : 'mutation'}，無法確認目標 repo）`);
+    if (/enablePullRequestAutoMerge/i.test(body)) add(ctx, 'merge-auto', text);
+    if (/mergePullRequest/i.test(body)) add(ctx, 'gh-merge', text);
+    if (/deleteRepository/i.test(body)) add(ctx, 'repo-delete', text);
+    if (/deleteRef\b/i.test(body)) add(ctx, 'branch-delete', text);
+    return;
+  }
+  if (method === 'GET' || method === 'HEAD') return;
+  const target = /^repos\/([^/]+)\/([^/?]+)/i.exec(endpoint);
+  if (target && !target[1]!.startsWith('{') && !target[2]!.startsWith('{') && !target[1]!.startsWith(':')) {
+    const repo = normalizeRepo(`${host}/${target[1]}/${target[2]}`);
+    if (!ctx.config.allowedRepos.includes(repo)) add(ctx, 'foreign-repo', `${text}（API 寫入 ${repo} 不在 allowedRepos）`);
+  } else add(ctx, 'foreign-repo', `${text}（${tool} 寫入，無法確認目標 repo）`);
+  if (method === 'DELETE' && /^repos\/[^/]+\/[^/?]+\/?$/i.test(endpoint)) add(ctx, 'repo-delete', text);
+  if (method === 'DELETE' && /\/git\/refs\//i.test(endpoint)) add(ctx, 'branch-delete', text);
+  if (/\/pulls\/[^/]+\/merge\b/i.test(endpoint)) {
+    add(ctx, 'gh-merge', text);
+    if (/merge_method\W*squash/i.test(body)) add(ctx, 'merge-squash', text);
+    if (/merge_method\W*rebase/i.test(body)) add(ctx, 'merge-rebase', text);
+  }
+}
+
 function gh(ctx: Ctx, cmd: Command): void {
   const argv = cmd.argv;
   const text = cmd.text;
   let repo: string | undefined;
+  let hostname = 'github.com';
   const pos: string[] = [];
   const flags: string[] = [];
   const fields: string[] = [];
+  let fromFile = false;
   let method: string | undefined;
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i]!;
@@ -605,13 +947,25 @@ function gh(ctx: Ctx, cmd: Command): void {
     const takes = GH_VALUE_FLAGS.has(short) && !(pos[0] === 'pr' && pos[1] === 'merge' && ['-r', '-m', '-s', '-d'].includes(short));
     const value = inline ?? attached ?? (takes ? argv[++i] : undefined);
     if (short === '-R' || name === '--repo') repo = value;
+    if (name === '--hostname' && value) hostname = value;
     if (short === '-X' || name === '--method') method = value?.toUpperCase();
-    if (['-f', '-F', '--field', '--raw-field'].includes(short) || ['--field', '--raw-field'].includes(name)) fields.push(value ?? '');
-    if (name === '--input' || short === '--input') fields.push(value ?? '');
+    if (['-f', '-F', '--field', '--raw-field'].includes(short) || ['--field', '--raw-field'].includes(name)) {
+      fields.push(value ?? '');
+      // `-F query=@file.graphql`: the value is read from a file
+      if ((short === '-F' || name === '--field') && /^[^=]*=@/.test(value ?? '')) fromFile = true;
+    }
+    if (name === '--input') {
+      fields.push(value ?? '');
+      fromFile = true;
+    }
   }
   const group = pos[0];
   const verb = pos[1];
   if (!group) return;
+  if (!GH_GROUPS.has(group)) {
+    add(ctx, 'unparsed', `${text}（gh ${group} 是別名或擴充指令，無法判斷它做什麼）`);
+    return;
+  }
   const foreign = (what: string) => {
     if (repo === undefined) add(ctx, 'foreign-repo', `${text}（沒有指定 --repo，gh 可能作用在 upstream）`);
     else if (!ctx.config.allowedRepos.includes(normalizeRepo(repo))) add(ctx, 'foreign-repo', `${text}（${what} ${repo} 不在 allowedRepos）`);
@@ -619,30 +973,12 @@ function gh(ctx: Ctx, cmd: Command): void {
   const flag = (...names: string[]) => flags.some(f => names.includes(f) || names.some(n => n.startsWith('--') && f.startsWith(`${n}=`)));
   const cluster = (letter: string) => flags.some(f => shortFlags(f).includes(letter));
   if (group === 'api') {
-    const endpoint = (verb ?? '').replace(/^\/+/, '');
     const m = method ?? (fields.length ? 'POST' : 'GET');
-    const all = fields.join(' ');
-    if (m === 'GET' && !/mutation/i.test(all)) return;
-    const target = /^repos\/([^/]+)\/([^/?]+)/i.exec(endpoint);
-    if (target && !target[1]!.startsWith('{') && !target[2]!.startsWith('{')) {
-      if (!ctx.config.allowedRepos.includes(`${target[1]}/${target[2]}`.toLowerCase())) add(ctx, 'foreign-repo', `${text}（API 寫入 ${target[1]}/${target[2]} 不在 allowedRepos）`);
-    } else if (endpoint !== 'graphql') add(ctx, 'foreign-repo', `${text}（gh api 寫入，無法確認目標 repo）`);
-    if (m === 'DELETE' && /^repos\/[^/]+\/[^/?]+\/?$/i.test(endpoint)) add(ctx, 'repo-delete', text);
-    if (m === 'DELETE' && /\/git\/refs\//i.test(endpoint)) add(ctx, 'branch-delete', text);
-    if (/\/pulls\/[^/]+\/merge\b/i.test(endpoint)) {
-      add(ctx, 'gh-merge', text);
-      if (/merge_method=squash/i.test(all)) add(ctx, 'merge-squash', text);
-      if (/merge_method=rebase/i.test(all)) add(ctx, 'merge-rebase', text);
-    }
-    if (endpoint === 'graphql') {
-      add(ctx, 'foreign-repo', `${text}（GraphQL mutation，無法確認目標 repo）`);
-      if (/enablePullRequestAutoMerge/i.test(all)) add(ctx, 'merge-auto', text);
-      if (/mergePullRequest/i.test(all)) add(ctx, 'gh-merge', text);
-      if (/deleteRepository/i.test(all)) add(ctx, 'repo-delete', text);
-      if (/deleteRef\b/i.test(all)) add(ctx, 'branch-delete', text);
-    }
+    githubApi(ctx, m, verb ?? '', fields.join(' '), fromFile, hostname, text, 'gh api');
     return;
   }
+  // `gh alias set` / `import` / `delete` change what a gh command means
+  if (group === 'alias' && verb && ['set', 'import', 'delete'].includes(verb)) add(ctx, 'config-files', text);
   if (group === 'pr' && verb === 'merge') {
     add(ctx, 'gh-merge', text);
     if (flag('--auto')) add(ctx, 'merge-auto', text);
@@ -652,13 +988,54 @@ function gh(ctx: Ctx, cmd: Command): void {
   }
   if (group === 'repo' && verb === 'delete') add(ctx, 'repo-delete', text);
   if (group === 'repo' && verb === 'edit' && flag('--enable-auto-merge')) add(ctx, 'merge-auto', text);
-  const writes = GH_WRITES[group];
-  if (writes && verb && (writes.includes(verb) || (group === 'ruleset' && verb !== 'list' && verb !== 'view' && verb !== 'check'))) {
+  const writes = GH_WRITES[group === 'rs' ? 'ruleset' : group];
+  if (writes && verb && (writes.includes(verb) || ((group === 'ruleset' || group === 'rs') && verb !== 'list' && verb !== 'view' && verb !== 'check'))) {
     // `gh repo delete owner/repo`, `gh repo edit owner/repo`: the repository is the operand
     if (group === 'repo' && repo === undefined && pos[2] && pos[2].includes('/')) repo = pos[2];
     if (group === 'repo' && verb === 'create') return;
     foreign('repo');
   }
+}
+
+// HTTP clients that can write to the GitHub API without gh
+const HTTP_CLIENTS = new Set(['curl', 'wget', 'wget2', 'http', 'https', 'httpie', 'xh', 'xhs', 'invoke-restmethod', 'irm', 'invoke-webrequest', 'iwr']);
+const HTTP_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+
+function httpGithub(ctx: Ctx, cmd: Command): void {
+  const argv = cmd.argv;
+  let url: string | undefined;
+  let method: string | undefined;
+  const body: string[] = [];
+  let fromFile = false;
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i]!;
+    const lower = a.toLowerCase();
+    const eq = a.indexOf('=');
+    const name = lower.startsWith('-') && eq > 0 ? lower.slice(0, eq) : lower;
+    const inline = lower.startsWith('-') && eq > 0 ? a.slice(eq + 1) : undefined;
+    const next = () => inline ?? argv[++i] ?? '';
+    // Short flags are case-sensitive (curl's -x is a proxy, -X the method); long and PowerShell ones are not
+    if (a === '-X' || name === '--request' || name === '--method' || name === '-method') method = next().toUpperCase();
+    else if (/^-X[A-Za-z]+$/.test(a)) method = a.slice(2).toUpperCase();
+    else if (['-d', '-F', '-T'].includes(a) || ['--data', '--data-raw', '--data-binary', '--data-ascii', '--data-urlencode', '--json', '--form', '--form-string', '--upload-file', '--post-data', '--body-data', '-body', '--raw'].includes(name)) {
+      const v = next();
+      body.push(v);
+      if (v.startsWith('@') || a === '-T' || name === '--upload-file') fromFile = true;
+    } else if (['--post-file', '--body-file', '-infile'].includes(name)) {
+      next();
+      fromFile = true;
+    } else if (/api\.github\.com(\/|$)/i.test(a) && url === undefined) url = a;
+    // httpie / xh: `http PUT url field=value`
+    else if (!a.startsWith('-') && url === undefined && HTTP_METHODS.has(a.toUpperCase())) method = a.toUpperCase();
+    else if (!a.startsWith('-') && url !== undefined && /^[^=:]+(:=|==|=|@)/.test(a)) {
+      body.push(a);
+      if (!/^[^=:]+==/.test(a)) method ??= 'POST';
+    }
+  }
+  if (url === undefined) return;
+  const m = method ?? (body.length || fromFile ? 'POST' : 'GET');
+  const path = url.replace(/^[a-z]+:\/\//i, '').replace(/^[^/]*api\.github\.com/i, '');
+  githubApi(ctx, m, path, body.join(' '), fromFile, 'github.com', clip(cmd.text), cmd.program);
 }
 
 const CONFIG_COMMANDS: { program: string; verbs: string[]; sub?: string }[] = [
@@ -680,6 +1057,7 @@ function commandHits(ctx: Ctx, cmd: Command, fallbackText: string): void {
   if (/(::|\.)(delete|deletefile|deletedirectory)$/.test(p) || /^\.delete$/.test(p)) add(ctx, 'delete-files', text);
   if (p === 'git') git(ctx, cmd);
   if (p === 'gh') gh(ctx, cmd);
+  if (HTTP_CLIENTS.has(p)) httpGithub(ctx, cmd);
   for (const c of CONFIG_COMMANDS) {
     if (p !== c.program) continue;
     const pos = positionals(cmd.argv);
@@ -688,8 +1066,15 @@ function commandHits(ctx: Ctx, cmd: Command, fallbackText: string): void {
   if (p === 'setx') add(ctx, 'config-files', text);
   const { writes, deletes } = fileTargets(cmd);
   if (deletes.length && (p === 'mv' || p === 'move' || p === 'move-item' || p === 'mi')) add(ctx, 'delete-files', text);
-  for (const w of writes) if (matchesAny(w, ctx.config.configMatchers)) add(ctx, 'config-files', `${text}（寫入 ${w}）`);
-  for (const w of [...writes, ...deletes]) if (matchesAny(w, ctx.config.selfMatchers)) add(ctx, 'self-config', `${text}（${w}）`);
+  const targets: { written: string; op: 'write' | 'delete' }[] = [...writes.map(w => ({ written: w, op: 'write' as const })), ...deletes.map(w => ({ written: w, op: 'delete' as const }))];
+  for (const { written, op } of targets) {
+    const path = resolve(written, cmd.cwd, ctx.cwd);
+    if (path === null) {
+      add(ctx, 'unreadable', `${text}（切換到無法判斷的目錄後${op === 'write' ? '寫入' : '刪除'} ${written}）`);
+      continue;
+    }
+    checkPath(ctx, path, resolve(written, cmd.cwd, undefined) ?? written, op, `${text}（${op === 'write' ? '寫入' : '刪除'} ${written}）`);
+  }
   for (const r of ctx.config.custom) {
     let matched = false;
     if (r.command && p === r.command[0]) {
@@ -698,7 +1083,6 @@ function commandHits(ctx: Ctx, cmd: Command, fallbackText: string): void {
       for (const w of words) if (k < r.command.length && w === r.command[k]) k++;
       matched = k === r.command.length;
     }
-    if (!matched && r.paths) matched = [...writes, ...deletes].some(w => matchesAny(w, r.paths!));
     if (!matched && r.pattern) matched = r.pattern.test(cmd.text);
     if (matched) addCustom(ctx, r, text);
   }
@@ -709,24 +1093,43 @@ function addCustom(ctx: Ctx, r: CustomRule, detail: string): void {
   ctx.hits.push({ rule: r.id, description: r.description, action: r.action, high: false, detail });
 }
 
-// The verdict for one permission hook payload
-export function evaluate(payload: unknown, config: Config): Verdict {
-  const req = extractRequest(payload);
-  const ctx: Ctx = { config, hits: [] };
+// A command line longer than this is not read at all (the card is asked for instead)
+export const MAX_COMMAND_LENGTH = 16 * 1024;
+// Time the judging may take before it gives up and asks; the hook's own limit (plugin.json `timeout`) is 10 s, and a
+// hook that runs past it counts as having no opinion, which would let the request through
+export const BUDGET_MS = 2000;
 
+export interface EvaluateOptions {
+  // Override BUDGET_MS (tests)
+  budgetMs?: number;
+}
+
+function judge(ctx: Ctx, req: Request): void {
+  const { config } = ctx;
+  tick(ctx);
+  if (req.execute && !req.commands.length) add(ctx, 'unreadable', '執行請求裡找不到要執行的指令');
   if (req.kind === 'delete') add(ctx, 'delete-files', clip(req.paths.join(', ') || '刪除工具'));
   for (const path of req.paths) {
-    if (matchesAny(path, config.selfMatchers)) add(ctx, 'self-config', path);
-    if (req.kind !== 'delete' && matchesAny(path, config.configMatchers)) add(ctx, 'config-files', path);
-    for (const r of config.custom) if (r.paths && matchesAny(path, r.paths)) addCustom(ctx, r, path);
+    const full = resolve(path, '', ctx.cwd) ?? path;
+    checkPath(ctx, full, path, req.kind === 'delete' ? 'delete' : 'write', path);
   }
 
   for (const src of req.commands) {
-    const a = analyze(src);
-    for (const cmd of a.commands) commandHits(ctx, cmd, src);
+    tick(ctx);
+    if (src.length > MAX_COMMAND_LENGTH) {
+      add(ctx, 'unreadable', `${clip(src)}（指令長 ${src.length} 字元，超過 ${MAX_COMMAND_LENGTH}，不解析）`);
+      continue;
+    }
+    const a = analyze(src, 'posix', ctx.deadline);
+    for (const cmd of a.commands) {
+      tick(ctx);
+      commandHits(ctx, cmd, src);
+    }
     for (const o of a.opaque) {
+      tick(ctx);
       const k = keywords(o.text);
       if (k.length) add(ctx, 'unparsed', `${clip(o.text)}（${o.why}：${k.join('、')}）`);
+      inlineWrites(ctx, o.text);
     }
     if (a.problems.length) {
       const k = keywords(src);
@@ -734,7 +1137,18 @@ export function evaluate(payload: unknown, config: Config): Verdict {
     }
     for (const r of config.custom) if (r.pattern && r.pattern.test(src)) addCustom(ctx, r, clip(src));
   }
+}
 
+// The verdict for one permission hook payload
+export function evaluate(payload: unknown, config: Config, options: EvaluateOptions = {}): Verdict {
+  const req = extractRequest(payload);
+  const ctx: Ctx = { config, hits: [], deadline: Date.now() + (options.budgetMs ?? BUDGET_MS), cwd: req.cwd };
+  try {
+    judge(ctx, req);
+  } catch (e) {
+    if (!(e instanceof OutOfTime)) throw e;
+    add(ctx, 'unreadable', `判斷超過 ${options.budgetMs ?? BUDGET_MS} 毫秒，停止解析`);
+  }
   const decision = ctx.hits.length === 0 ? 'pass' : ctx.hits.some(h => h.action === 'deny') ? 'deny' : 'ask';
   return { decision, hits: ctx.hits, reason: describe(ctx.hits) };
 }
