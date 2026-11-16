@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Threading::{
   BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 
-/// Overrides the setting: 1-99 caps at that percentage, 0 or 100 lifts it (priority stays below normal either way)
+/// Overrides the setting: 1-99 caps at that percentage, 0 or 100 lifts it (the priority is `ACPIRA_AGENT_PRIORITY`'s)
 pub const CPU_CAP_ENV: &str = "ACPIRA_AGENT_CPU_CAP";
 
 /// The share of the whole machine (every logical core) all agents of this process may use together, in percent, as the
@@ -49,11 +49,25 @@ fn set_info<T>(job: &OwnedHandle, class: JOBOBJECTINFOCLASS, info: &T) -> io::Re
   Ok(())
 }
 
-/// Below normal priority for every process in the job: a busy agent yields the CPU to whatever the user is doing
+/// `normal` leaves agents at the priority they inherit; anything else (or unset) keeps them below normal
+pub const PRIORITY_ENV: &str = "ACPIRA_AGENT_PRIORITY";
+
+/// False only for `ACPIRA_AGENT_PRIORITY=normal`. On a machine whose cores are already busy with normal-priority work a
+/// below-normal agent barely runs: claude-agent-acp 0.107.0 then never answered `initialize` (over 120 s, against
+/// 28–50 s at normal priority on the same loaded machine)
+fn below_normal(value: Option<&str>) -> bool {
+  !value.is_some_and(|v| v.trim().eq_ignore_ascii_case("normal"))
+}
+
+/// Below normal priority for every process in the job, unless `ACPIRA_AGENT_PRIORITY=normal`: a busy agent yields the
+/// CPU to whatever the user is doing
 fn limits(flags: u32) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
   let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-  info.BasicLimitInformation.LimitFlags = flags | JOB_OBJECT_LIMIT_PRIORITY_CLASS;
-  info.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+  info.BasicLimitInformation.LimitFlags = flags;
+  if below_normal(std::env::var(PRIORITY_ENV).ok().as_deref()) {
+    info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS;
+    info.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+  }
   info
 }
 
@@ -98,7 +112,12 @@ fn parent() -> Option<&'static OwnedHandle> {
         // SAFETY: null security attributes make the new anonymous handle non-inheritable.
         let job = own(unsafe { CreateJobObjectW(null(), null()) })?;
         set_info(&job, JobObjectExtendedLimitInformation, &limits(0))?;
-        apply_cap(&job, effective_cap())?;
+        // A lifted cap sets nothing: turning rate control off on a job that never had it fails with
+        // ERROR_INVALID_PARAMETER, which lost the shared job altogether
+        let cap = effective_cap();
+        if cap > 0 {
+          apply_cap(&job, cap)?;
+        }
         io::Result::Ok(job)
       })();
       made.inspect_err(|e| eprintln!("agent job: no shared CPU limit ({e})")).ok()
@@ -196,7 +215,16 @@ pub fn process_info(pid: u32) -> Option<(u32, String)> {
 
 #[cfg(test)]
 mod tests {
-  use super::cpu_cap_override;
+  use super::{below_normal, cpu_cap_override};
+
+  #[test]
+  fn only_an_explicit_normal_lifts_the_below_normal_priority() {
+    assert!(below_normal(None));
+    assert!(below_normal(Some("")));
+    assert!(below_normal(Some("below")));
+    assert!(!below_normal(Some("normal")));
+    assert!(!below_normal(Some(" Normal ")));
+  }
 
   #[test]
   fn the_cpu_cap_override_lifts_at_zero_or_a_hundred_and_ignores_garbage() {
