@@ -1,4 +1,5 @@
-import type { SessionSummary } from '@acpira/shared/transcript';
+import type { SessionCategories, SessionSummary } from '@acpira/shared/transcript';
+import { projectOf as projectOfMeta, projectSessions } from './sessionTree';
 
 // What the title row's inbox (chat/AttentionInbox.tsx) and the session switcher (chat/SessionSwitcher.tsx) make of the
 // session states the engine reports. Pure, so the sorting and the matching are tested on their own (test/attention.test.ts)
@@ -13,6 +14,17 @@ export interface Inbox {
   reply: SessionSummary[];
   review: SessionSummary[];
   running: SessionSummary[];
+}
+
+// The sessions the desktop session column lists, whatever its view filter: a folder the app took off its list, or a host
+// folder it never added, shows its sessions only in a search there (sessionTree.ts projectSessions), so the inbox and the
+// switcher leave them out as well, as `nextAttention` does (sessionNav.ts orderedSessions)
+export function listedSessions(sessions: readonly SessionSummary[], categories?: SessionCategories): SessionSummary[] {
+  const meta = categories?.projectMeta;
+  return projectSessions(sessions as SessionSummary[], {
+    registered: categories?.projects ?? [], removed: categories?.removedProjects,
+    filtering: false, expand: false, projectOf: cwd => projectOfMeta(meta, cwd),
+  });
 }
 
 // The section a session belongs in, if any. Archived sessions never show; the session on screen needs no review
@@ -106,10 +118,13 @@ export function switcherOrder(sessions: readonly SessionSummary[], activeId: str
 // `at` lists the matched character indices of `text` (for highlighting). Undefined: no match
 export interface Fuzzy { score: number; at: number[] }
 const WORD_BREAK = /[\s\-_/\\.:,()[\]{}「」『』（）、，。·]/;
+// One character's case fold, kept to one character: a few lower to several ('İ' to 'i' and a combining dot), which would
+// shift every index after them
+const fold = (c: string) => [...c.toLowerCase()][0] ?? c;
 export function fuzzyMatch(query: string, text: string): Fuzzy | undefined {
-  const q = [...query.toLowerCase()];
+  const q = [...query].map(fold);
   const chars = [...text];
-  const lower = chars.map(c => c.toLowerCase());
+  const lower = chars.map(fold);
   if (!q.length) return { score: 0, at: [] };
   // A plain substring scores best: try it first so "inbox" in "Attention inbox" lands on the word, not on scattered letters
   const joined = lower.join('');

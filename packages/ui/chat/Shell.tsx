@@ -62,7 +62,7 @@ import { droppedPathResolver, hostDragPaths, setWebviewState, webviewState } fro
 import { focusMainComposer, mainComposerEmpty, moveDraft } from './useComposerDraft';
 import { pendingQuickPermission } from './permissionOptions';
 import { nextAttentionSession, orderedSessions, stepSession } from './sessionNav';
-import { readRecent, touchRecent } from './attention';
+import { listedSessions, readRecent, touchRecent } from './attention';
 import { AttentionInbox } from './AttentionInbox';
 import { SessionSwitcher } from './SessionSwitcher';
 import { inWorkspace } from '@acpira/shared/settings';
@@ -809,7 +809,14 @@ export function Shell(p: ShellProps) {
     setRecent(prev => touchRecent(prev, p.activeSessionId!));
   }, [p.activeSessionId, p.sample]);
   useEffect(() => { if (!p.sample) setWebviewState(RECENT_KEY, recent); }, [recent, p.sample]);
-  const openSwitcher = useCallback(() => { if (!p.sample) setSwitcher(o => !o); }, [p.sample]);
+  const switcherOpen = useRef(false);
+  switcherOpen.current = switcher;
+  const openSwitcher = useCallback(() => {
+    if (p.sample) return;
+    // Opening: keys typed before the field takes the focus must not reach the composer (or whatever held it)
+    if (!switcherOpen.current && document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    setSwitcher(o => !o);
+  }, [p.sample]);
   const openChatFind = useCallback(() => {
     if (p.noProject || startPage || !p.turns.length) return;
     const sel = window.getSelection();
@@ -864,6 +871,7 @@ export function Shell(p: ShellProps) {
     overlayInspect, chatFindOpen: !!chatFind,
     selectSession: (id: string) => { on.selectSession(id); closeDrawer(); },
     stop: on.stop, permission: on.permission, openChatFind, openSwitcher, openSettings,
+    hasSessionPanel: position !== 'hidden',
   });
   shellKeys.current = {
     sessions: p.sessions, categories: p.categories, activeSessionId: p.activeSessionId, pendingSessionId: p.pendingSessionId,
@@ -872,6 +880,7 @@ export function Shell(p: ShellProps) {
     overlayInspect, chatFindOpen: !!chatFind,
     selectSession: (id: string) => { on.selectSession(id); closeDrawer(); },
     stop: on.stop, permission: on.permission, openChatFind, openSwitcher, openSettings,
+    hasSessionPanel: position !== 'hidden',
   };
   useEffect(() => {
     if (p.sample) return;
@@ -894,8 +903,9 @@ export function Shell(p: ShellProps) {
         return;
       }
 
-      // ⌘K (desktop: the shell's own keys below): the session switcher, which reaches the column's search too
-      if (!inDialog && !desktop && hitShortcut(e, 'searchSessions')) {
+      // ⌘K (desktop: the shell's own keys below): the session switcher, which reaches the column's search too. An IDE
+      // whose session list folds into the header leaves the key to the host (VS Code's ⌘K chords)
+      if (!inDialog && !desktop && cur.hasSessionPanel && hitShortcut(e, 'searchSessions')) {
         e.preventDefault();
         cur.openSwitcher();
         return;
@@ -1072,7 +1082,11 @@ export function Shell(p: ShellProps) {
   const openSession = useCallback((id: string) => { on.selectSession(id); closeDrawer(); }, [on.selectSession, closeDrawer]);
   // What the switcher reaches: every project in the desktop app, the list's scope in an IDE (the session on screen always)
   const shownId = p.pendingSessionId ?? p.activeSessionId;
-  const switcherSessions = !switcher ? [] : desktop || p.sessionScope === 'all' || !p.workspace ? p.sessions
+  // The desktop app's inbox and switcher reach what its session column lists: a removed project's sessions stay out
+  const listed = useMemo(() => desktop ? listedSessions(p.sessions, p.categories) : p.sessions, [desktop, p.sessions, p.categories]);
+  const switcherSessions = !switcher ? [] : desktop
+    ? (listed.some(s => s.id === shownId) ? listed : listed.concat(p.sessions.filter(s => s.id === shownId)))
+    : p.sessionScope === 'all' || !p.workspace ? p.sessions
     : p.sessions.filter(s => inWorkspace(s, p.workspace!) || s.id === shownId);
   const sessionsPanel = (
     <SessionList
@@ -1670,7 +1684,7 @@ export function Shell(p: ShellProps) {
                 searchFiles={on.searchFiles} openEditor={openInEditor} openPlan={openPlanInEditor} shareSelection={p.shareEditorSelection} context={contextTab} />)}
           {/* Last, so it stays over the drawer of a narrow window. The files layout's left column is the explorer */}
           {desktop && <TitleRow onBack={trail.back} onForward={trail.forward}
-            inbox={!p.sample && <AttentionInbox sessions={p.sessions} activeId={p.pendingSessionId ?? p.activeSessionId}
+            inbox={!p.sample && <AttentionInbox sessions={listed}activeId={p.pendingSessionId ?? p.activeSessionId}
               categories={p.categories} chats={p.chats} onSelect={openSession} />}
             column={files
               ? { open: !explorerHidden, drawer: false, onToggle: leftSide }

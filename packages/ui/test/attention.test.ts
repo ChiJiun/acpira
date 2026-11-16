@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SessionSummary } from '@acpira/shared/transcript';
-import { buildInbox, fuzzyMatch, highlightRuns, inboxCount, inboxSection, inboxStatus, matchSessions, readRecent, switcherOrder, touchRecent } from '../chat/attention';
+import { buildInbox, fuzzyMatch, highlightRuns, inboxCount, inboxSection, inboxStatus, listedSessions, matchSessions, readRecent, switcherOrder, touchRecent } from '../chat/attention';
 
 const at = (m: number) => new Date(Date.UTC(2026, 10, 17, 12, 0) - m * 60_000).toISOString();
 const s = (id: string, extra: Partial<SessionSummary> = {}): SessionSummary => ({ id, title: id, agent: 'claude', cwd: '/work/a', updatedAt: at(10), ...extra });
@@ -43,6 +43,30 @@ describe('inbox sections', () => {
     expect(ids(inbox.running)).toEqual(['bg', 'run']);
     expect(inboxCount(inbox)).toBe(4);
     expect(inboxCount(buildInbox([s('x', { state: 'working' })]))).toBe(0);
+  });
+  it('leaves out the sessions of folders the list keeps off, as the session column does', () => {
+    const categories = {
+      categories: [], collapsedProjects: [],
+      projects: ['/work/a', 'ssh://box/srv'],
+      removedProjects: ['/work/gone'],
+      projectMeta: { '/work/a': { extra: ['/work/a-docs'] } },
+    };
+    const listed = listedSessions([
+      s('here', { state: 'unread' }),
+      s('extra', { state: 'error', cwd: '/work/a-docs' }),
+      s('removed', { state: 'unread', cwd: '/work/gone' }),
+      s('removed-wait', { state: 'waiting', cwd: '/work/gone' }),
+      s('host', { state: 'unread', cwd: 'ssh://box/srv' }),
+      s('stray-host', { state: 'unread', cwd: 'ssh://box/other' }),
+      s('unlisted-local', { state: 'unread', cwd: '/work/new' }),
+    ], categories);
+    expect(ids(listed)).toEqual(['here', 'extra', 'host', 'unlisted-local']);
+    const inbox = buildInbox(listed);
+    expect(ids(inbox.review)).not.toContain('removed');
+    expect(inbox.reply).toEqual([]);
+    expect(inboxCount(inbox)).toBe(4);
+    // Before a project shell first connects nothing is kept off
+    expect(listedSessions([s('a', { cwd: '/work/gone' })])).toHaveLength(1);
   });
   it('names a waiting session by what it waits for', () => {
     expect(inboxStatus(s('a', { state: 'waiting' }))).toBe('permission');
@@ -112,6 +136,12 @@ describe('fuzzy matching', () => {
   it('handles CJK and astral characters by character', () => {
     expect(fuzzyMatch('切換', '工作階段快速切換器')?.at).toEqual([6, 7]);
     expect(fuzzyMatch('b', '😀b')?.at).toEqual([1]);
+  });
+  it('keeps one index per character when a capital lowers to several', () => {
+    expect(fuzzyMatch('istan', 'İstanbul')?.at).toEqual([0, 1, 2, 3, 4]);
+    expect(fuzzyMatch('bul', 'İstanbul')?.at).toEqual([5, 6, 7]);
+    expect(fuzzyMatch('İst', 'İstanbul')?.at).toEqual([0, 1, 2]);
+    expect(fuzzyMatch('sb', 'İstanbul')?.at).toEqual([1, 5]);
   });
   it('splits text into highlight runs', () => {
     expect(highlightRuns('inbox', [0, 1])).toEqual(['', 'in', 'box']);

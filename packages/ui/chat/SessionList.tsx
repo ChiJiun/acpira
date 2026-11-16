@@ -276,8 +276,10 @@ export interface SessionListProps {
   chats?: string;
   // Desktop: the chats section's pen, a new chat on the start page
   onNewChat?: () => void;
-  // A query to put in the search field (the session switcher's "search messages" row); a new seq puts it again
+  // A query to put in the search field (the session switcher's "search messages" row); a new seq puts it again.
+  // `onSeedTaken` reports it put, so the owner drops it and a remounted list does not put a stale query again
   searchSeed?: { query: string; seq: number };
+  onSeedTaken?: (seq: number) => void;
 }
 
 // The drag payload's type: WebKit starts no drag without data. Telling a row's drag goes by `held`, not by this type
@@ -351,7 +353,7 @@ function perKey<T>(compute: (key: string) => T): (key: string) => T {
 // (FlipRows). The desktop app (DesktopContext) lists its registered projects in their own order without categories, each
 // open project its latest sessions with the rest behind one row.
 // Deletion applies immediately, undo lives on the Toast at the shell's bottom
-export const SessionList = memo(function SessionList({ sessions, agents, activeId, workspace, scope = 'all', autoFocus, fill, activeAgent, nativeSessions, onListNative, onImportNative, onSelect, onRename, onDelete, onPin, onArchive, onUnread, onMove, onExport, onCopy, onSearch, categories: categoryState, onFile, onCategoryOp, onNewInCategory, nav, onNew, onNewIn, onAddProject, onAddRemote, onEditProject, onRevealPath, onCopyPath, fresh, onMarkAllRead, chats, onNewChat, searchSeed }: SessionListProps) {
+export const SessionList = memo(function SessionList({ sessions, agents, activeId, workspace, scope = 'all', autoFocus, fill, activeAgent, nativeSessions, onListNative, onImportNative, onSelect, onRename, onDelete, onPin, onArchive, onUnread, onMove, onExport, onCopy, onSearch, categories: categoryState, onFile, onCategoryOp, onNewInCategory, nav, onNew, onNewIn, onAddProject, onAddRemote, onEditProject, onRevealPath, onCopyPath, fresh, onMarkAllRead, chats, onNewChat, searchSeed, onSeedTaken }: SessionListProps) {
   const locale = useLocale();
   const desktop = useDesktop();
   const projectMarks = useAppearance().projectMarks === 'on';
@@ -359,7 +361,11 @@ export const SessionList = memo(function SessionList({ sessions, agents, activeI
   const connections = useConnections();
   const remoteHosts = onAddRemote ? connections : undefined;
   const [query, setQuery] = useState('');
-  useEffect(() => { if (searchSeed) setQuery(searchSeed.query); }, [searchSeed]);
+  useEffect(() => {
+    if (!searchSeed) return;
+    setQuery(searchSeed.query);
+    onSeedTaken?.(searchSeed.seq);
+  }, [searchSeed, onSeedTaken]);
   // The view menu's choices (grouping, ordering, what rows show, filters), kept per window across reloads
   const [view, setViewState] = useState<ListView>(() => readView(webviewState(VIEW_KEY)));
   const setView = (next: ListView) => { setViewState(next); setWebviewState(VIEW_KEY, next); };

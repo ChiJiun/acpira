@@ -16,6 +16,9 @@ import { StateMark } from './SessionList';
 // titles and project names fuzzily. Its last row hands the query to the session column's message search, which ⌘K used
 // to focus
 
+// Rows rendered at most: a typed query narrows the rest, and the last row still hands it to the message search
+const MAX_ROWS = 100;
+
 const GROUP_LABEL: Record<SwitcherGroup, 'session.inbox.reply' | 'session.inbox.review' | 'session.switcher.recent'> = {
   reply: 'session.inbox.reply',
   review: 'session.inbox.review',
@@ -57,11 +60,14 @@ export function SessionSwitcher({ sessions, activeId, recent, agents, categories
     };
   }, [categories, chats]);
   // Rows read their state from the latest push, so a mark stays live while the switcher is open
+  // (one deleted or archived since the switcher opened drops out)
   const latest = useMemo(() => new Map(sessions.map(s => [s.id, s])), [sessions]);
+  // Matching stays in step with the field (Enter picks what is shown); only the rendered rows are capped, the scoring
+  // itself is cheap even over a long session list
   const typed = query.trim();
   const hits = useMemo(() => {
-    const ordered = base.map(e => latest.get(e.session.id) ?? e.session).filter(s => !s.archived);
-    return matchSessions(ordered, typed, project);
+    const ordered = base.flatMap(e => { const s = latest.get(e.session.id); return s && !s.archived ? [s] : []; });
+    return matchSessions(ordered, typed, project).slice(0, MAX_ROWS);
   }, [base, latest, typed, project]);
   const groupOf = useMemo(() => new Map(base.map(e => [e.session.id, e.group])), [base]);
   const searchRow = !!onSearchContent && !!typed;
@@ -107,6 +113,7 @@ export function SessionSwitcher({ sessions, activeId, recent, agents, categories
               <Search className="size-icon shrink-0" strokeWidth={1.5} aria-hidden />
               <input
                 ref={input}
+                autoFocus
                 value={query}
                 spellCheck={false}
                 role="combobox"
