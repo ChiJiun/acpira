@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "id": "pr-loop",
+  "version": "0.1.0",
+  "name": "PR loop",
+  "description": "Runs a PR through fresh independent reviews, fixes, CI and one merge-commit merge, stopping for the user when stuck",
+  "requires": ["node", "gh"],
+  "contributes": {
+    "commands": [
+      {
+        "name": "pr-loop",
+        "description": "PR 自動循環：獨立 review → 修正 → CI → 合併（status / stop / resume / config）",
+        "hint": "<PR 編號或網址> [需求原文] | status | stop | resume | config"
+      }
+    ],
+    "runtime": {
+      "main": "src/index.ts",
+      "hooks": ["command"],
+      "events": ["turn.ended"],
+      "timeout": 10
+    }
+  }
+}
