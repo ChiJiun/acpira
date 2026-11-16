@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "id": "approval-rules",
+  "version": "0.1.0",
+  "name": "Approval rules",
+  "description": "Deletes, git push, config edits, merges and writes to other repos always get a permission card, even under full access",
+  "requires": ["node"],
+  "contributes": {
+    "runtime": {
+      "main": "plugin.ts",
+      "hooks": ["permission"],
+      "methods": ["status", "check"],
+      "timeout": 5
+    }
+  }
+}
