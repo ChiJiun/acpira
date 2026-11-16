@@ -32,8 +32,8 @@ if [ "${1:-}" = "--if-stale" ]; then
   echo "== acpira-mobile changed since the last build: rebuilding the Android library"
 fi
 
-# Git Bash on Windows: Android Studio keeps the SDK under %LOCALAPPDATA%, the NDK's clang wrappers are .cmd files (cc-rs
-# and rustc both run them), and what Cargo is handed must be a Windows path
+# Git Bash on Windows: Android Studio keeps the SDK under %LOCALAPPDATA%, the NDK's clang wrappers are .cmd files (rustc
+# links through them, cc-rs swaps them for clang.exe --target), and what Cargo is handed must be a Windows path
 windows=""
 case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) windows=1 ;; esac
 default_sdk="$HOME/Library/Android/sdk"
