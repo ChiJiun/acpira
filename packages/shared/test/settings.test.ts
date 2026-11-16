@@ -30,6 +30,16 @@ describe('sanitizeSetting (appearance)', () => {
     expect(DEFAULT_SETTINGS.agentCpuCap).toBe(80);
   });
 
+  // Mirrors acpira_shared::settings::sanitize_setting("agentPriority")
+  it('the agent priority is below normal unless it says normal', () => {
+    expect(DEFAULT_SETTINGS.agentPriority).toBe('belowNormal');
+    expect(sanitizeSetting('agentPriority', 'normal')).toBe('normal');
+    expect(sanitizeSetting('agentPriority', 'belowNormal')).toBe('belowNormal');
+    expect(sanitizeSetting('agentPriority', 'high')).toBe('belowNormal');
+    expect(sanitizeSetting('agentPriority', undefined)).toBe('belowNormal');
+    expect(isSharedSetting('agentPriority')).toBe(true);
+  });
+
   // Mirrors acpira_shared::settings::proxy_setting: the engine and the page must agree on what a value means
   it('the proxy is auto, off or a normalized proxy URL; anything else reads as auto', () => {
     expect(DEFAULT_SETTINGS.proxy).toBe('auto');

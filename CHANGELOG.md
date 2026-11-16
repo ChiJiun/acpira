@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- On Windows, the new `acpira.agentPriority` setting (General › Running) lets agents run at normal priority instead of below normal, for machines whose cores are already busy and where a below-normal agent barely starts. Below normal stays the default; it applies to agents started afterwards, and `ACPIRA_AGENT_PRIORITY=normal|belowNormal` overrides it.
+
+### Fixed
+
+- On Windows, lifting the agent CPU cap when it had never been set no longer logs a misleading "CPU limit unchanged (os error 87)".
+
 ### Planned
 
 - An interrupt follow-up mode remains planned. Mid-turn messages on agents without steering stay in the host-side queue.

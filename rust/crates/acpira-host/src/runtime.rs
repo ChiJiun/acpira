@@ -431,6 +431,7 @@ impl HostRuntime {
     let settings = Arc::downgrade(&runtime.settings);
     set_wire_locale(Arc::new(move |wire| settings.upgrade().map(|s| s.locale_for(Some(wire)))));
     runtime.apply_cpu_cap();
+    runtime.apply_agent_priority();
     crate::net_proxy::set_setting(&runtime.settings.view().proxy);
     // Whether npm's global prefix is writable decides the copyable install line of the npm agents (installer.rs)
     let rt = runtime.clone();
@@ -448,6 +449,12 @@ impl HostRuntime {
   fn apply_cpu_cap(&self) {
     #[cfg(windows)]
     crate::platform::windows_process::set_cpu_cap(self.settings.view().agent_cpu_cap as u32);
+  }
+
+  /// The `agentPriority` setting onto the agents started from now on (Windows only; elsewhere the setting is inert)
+  fn apply_agent_priority(&self) {
+    #[cfg(windows)]
+    crate::platform::windows_process::set_agent_priority(self.settings.view().agent_priority == "normal");
   }
 
   async fn reload_agent_config(&self) -> Result<()> {
@@ -547,6 +554,11 @@ impl HostRuntime {
     }
     if affects(Some("agentCpuCap")) {
       self.apply_cpu_cap();
+    }
+    if affects(Some("agentPriority")) {
+      // A warm process was spawned with the old priority; the next session starts a fresh one
+      self.apply_agent_priority();
+      self.manager.invalidate_warm_pool();
     }
     if affects(Some("proxy")) {
       // Agents started from now on take the new route; running ones keep the environment they were spawned with

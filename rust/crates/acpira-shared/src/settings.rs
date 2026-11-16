@@ -18,6 +18,10 @@ pub const MIN_COMPACT_AT_TOKENS: i64 = 10_000;
 pub const COMPACT_AT_MODEL: i64 = 0;
 /// Share of all logical cores every agent of an engine may use together, in percent; 100 lifts the cap (Windows only)
 pub const AGENT_CPU_CAP: (i64, i64, i64) = (10, 100, 80);
+/// Priority class of every agent process and its descendants (Windows only): below normal yields the CPU to the
+/// desktop, normal keeps agents responsive on a machine already busy with normal-priority work
+pub const AGENT_PRIORITIES: [&str; 2] = ["belowNormal", "normal"];
+pub const DEFAULT_AGENT_PRIORITY: &str = "belowNormal";
 /// The `proxy` setting's default: the local 127.0.0.1:7890 proxy while it listens, the inherited environment otherwise
 pub const DEFAULT_PROXY: &str = "auto";
 /// How the desktop app opens file links and plan documents: the system's default application or an editor's command line
@@ -30,7 +34,7 @@ pub const DEFAULT_DESKTOP_LAYOUT: &str = "chat";
 pub const PANEL_SCOPES: [&str; 3] = ["project", "session", "global"];
 pub const DEFAULT_PANEL_SCOPE: &str = "project";
 
-pub const SETTING_KEYS: [&str; 31] = [
+pub const SETTING_KEYS: [&str; 32] = [
   "language",
   "defaultAgent",
   "agentOrder",
@@ -54,6 +58,7 @@ pub const SETTING_KEYS: [&str; 31] = [
   "sshLocalAgents",
   "subagents",
   "agentCpuCap",
+  "agentPriority",
   "proxy",
   "openFilesWith",
   "desktopLayout",
@@ -109,6 +114,9 @@ pub struct SettingsView {
   /// CPU hard cap over every agent process and its descendants, percent of all cores (`AGENT_CPU_CAP`, Windows job objects)
   #[serde(default = "default_agent_cpu_cap")]
   pub agent_cpu_cap: i64,
+  /// Priority class of every agent process tree (`AGENT_PRIORITIES`, Windows job objects; `ACPIRA_AGENT_PRIORITY` overrides)
+  #[serde(default = "default_agent_priority")]
+  pub agent_priority: String,
   /// Network route of agents, installers and downloads: `auto`, `off` or a proxy URL (`proxy_setting`)
   #[serde(default = "default_proxy")]
   pub proxy: String,
@@ -147,6 +155,10 @@ pub fn ssh_local_agents(value: &Value) -> Vec<AgentId> {
 
 fn default_agent_cpu_cap() -> i64 {
   AGENT_CPU_CAP.2
+}
+
+fn default_agent_priority() -> String {
+  DEFAULT_AGENT_PRIORITY.into()
 }
 
 fn default_proxy() -> String {
@@ -266,6 +278,7 @@ pub fn sanitize_setting(key: &str, value: &Value) -> Value {
     "uiFontSize" => Value::from(clamp_size(value, UI_FONT_SIZE)),
     "codeFontSize" => Value::from(clamp_size(value, CODE_FONT_SIZE)),
     "agentCpuCap" => Value::from(clamp_size(value, AGENT_CPU_CAP)),
+    "agentPriority" => Value::from(one_of(value, &AGENT_PRIORITIES, DEFAULT_AGENT_PRIORITY)),
     "proxy" => Value::from(proxy_setting(value)),
     "theme" => Value::from(one_of(value, &["auto", "light", "dark"], "auto")),
     "diffMarkers" => Value::from(one_of(value, &["color", "signs"], "color")),
@@ -448,6 +461,15 @@ mod tests {
     assert_eq!(sanitize_setting("agentCpuCap", &Value::from(250)), Value::from(100));
     assert_eq!(sanitize_setting("agentCpuCap", &Value::from("50")), Value::from(80));
     assert!(is_setting_key("agentCpuCap"));
+  }
+
+  #[test]
+  fn the_agent_priority_is_below_normal_unless_it_says_normal() {
+    assert_eq!(sanitize_setting("agentPriority", &Value::from("normal")), Value::from("normal"));
+    assert_eq!(sanitize_setting("agentPriority", &Value::from("belowNormal")), Value::from("belowNormal"));
+    assert_eq!(sanitize_setting("agentPriority", &Value::from("high")), Value::from("belowNormal"));
+    assert_eq!(sanitize_setting("agentPriority", &Value::Null), Value::from("belowNormal"));
+    assert!(is_setting_key("agentPriority") && is_shared_setting("agentPriority"));
   }
 
   #[test]
