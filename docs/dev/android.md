@@ -86,6 +86,7 @@
 ## Checks
 
 - `cd apps/android && ./gradlew :model:test :sync:test :app:assembleDebug` (JDK 21: `JAVA_HOME=$(/usr/libexec/java_home -v 21)`).
+- On Windows the build runs from Git Bash, with a Rust toolchain that has the `aarch64-linux-android` target. Open: only `assembleDebug` has run there, not the tests or the e2e scripts.
 - `apps/android/scripts/e2e.sh`: the app against `apps/ios/scripts/engine.sh` (fake agent only) on a booted emulator, driven through its screens: a new chat's reply, then a permission approved.
 - `apps/android/scripts/e2e-paired.sh`: a fresh install against `apps/ios/scripts/gateway.sh` (fake agent, relays off): pair by code, the wire, a reply and a permission over the link. It clears the app's data.
 - An `adb install -r` relaunches the replaced activity with its old intent; a launch right after it can show the old screen. Force-stop and wait a second first, as the scripts do. The same goes after `pm clear` / `pm grant`: the system's teardown can kill a launch that follows at once, leaving the splash up.

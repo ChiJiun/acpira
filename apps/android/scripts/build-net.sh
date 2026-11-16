@@ -32,10 +32,22 @@ if [ "${1:-}" = "--if-stale" ]; then
   echo "== acpira-mobile changed since the last build: rebuilding the Android library"
 fi
 
-sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+# Git Bash on Windows: Android Studio keeps the SDK under %LOCALAPPDATA%, the NDK's clang wrappers are .cmd files (rustc
+# links through them, cc-rs swaps them for clang.exe --target), and what Cargo is handed must be a Windows path
+windows=""
+case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) windows=1 ;; esac
+default_sdk="$HOME/Library/Android/sdk"
+[ -z "$windows" ] || default_sdk="$(cygpath -u "${LOCALAPPDATA:-$HOME/AppData/Local}")/Android/Sdk"
+sdk="${ANDROID_HOME:-$default_sdk}"
 ndk="${ANDROID_NDK_HOME:-$(find "$sdk/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1)}"
 [ -d "$ndk" ] || { echo "no NDK under $sdk/ndk: install one with sdkmanager" >&2; exit 1; }
 toolchain="$(echo "$ndk"/toolchains/llvm/prebuilt/*/bin)"
+clang_ext=""
+if [ -n "$windows" ]; then
+  toolchain="$(cygpath -m "$toolchain")"
+  work="$(cygpath -m "$work")"
+  clang_ext=".cmd"
+fi
 
 triple() {
   case "$1" in
@@ -61,8 +73,8 @@ for abi in "${abis[@]}"; do
   t="$(triple "$abi")"
   # cc-rs (ring's C parts) and rustc's link step both use the NDK's clang for the app's API level
   env_t="$(tr '[:lower:]-' '[:upper:]_' <<<"$t")"
-  export "CARGO_TARGET_${env_t}_LINKER=$toolchain/$t$api-clang"
-  export "CC_${t//-/_}=$toolchain/$t$api-clang" "AR_${t//-/_}=$toolchain/llvm-ar"
+  export "CARGO_TARGET_${env_t}_LINKER=$toolchain/$t$api-clang$clang_ext"
+  export "CC_${t//-/_}=$toolchain/$t$api-clang$clang_ext" "AR_${t//-/_}=$toolchain/llvm-ar"
   echo "== cargo build acpira-mobile for $abi"
   (cd "$rust" && cargo rustc --locked -p acpira-mobile --lib --crate-type cdylib --profile mobile --target "$t")
 done
