@@ -41,6 +41,14 @@ async function config(ctx: Context): Promise<ReportConfig> {
 }
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
+// A request the engine never answers must not hold this session's checks for good (`checking` chains them)
+const ENGINE_WAIT_MS = 15_000;
+const MODEL_WAIT_MS = 60_000;
+function within<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} took longer than ${ms / 1000} s`)), ms); });
+  return Promise.race([work, late]).finally(() => clearTimeout(timer));
+}
 
 async function check(data: Record<string, unknown>, ctx: Context): Promise<void> {
   const session = typeof data.session === 'string' ? data.session : undefined;
@@ -48,18 +56,23 @@ async function check(data: Record<string, unknown>, ctx: Context): Promise<void>
   const cfg = await config(ctx);
   if (!cfg.enabled) return;
   await delay(SETTLE_MS);
-  const view = await ctx.session.get(session, TURNS_READ);
+  const view = await within(ctx.session.get(session, TURNS_READ), ENGINE_WAIT_MS, 'session/get');
   const end = { stop: typeof data.stop === 'string' ? data.stop : undefined, error: data.error ?? undefined, agent: typeof data.agent === 'string' ? data.agent : undefined };
   let decision = evaluateTurn(end, view, memos.get(session), cfg);
   if (decision.action === 'ask' && cfg.model.enabled) {
     try {
       const { system, prompt } = judgePrompt(decision.work.reply, cfg);
-      const answer = await ctx.model.generate({ prompt, system, maxTokens: cfg.model.maxTokens, ...(cfg.model.model ? { model: cfg.model.model } : {}) });
+      const answer = await within(ctx.model.generate({ prompt, system, maxTokens: cfg.model.maxTokens, ...(cfg.model.model ? { model: cfg.model.model } : {}) }), MODEL_WAIT_MS, 'model/generate');
       const judged = applyJudge(decision.check, parseJudge(String(answer?.text ?? '')), decision.work.reply, cfg);
       if (judged.pass) decision = { action: 'pass', check: judged, work: decision.work };
     } catch (e) {
       // No model source, or the call failed: the keyword check stands
       ctx.log(`turn-report: model check failed, keeping the keyword check (${(e as Error).message})`);
+    }
+    // The model took its time: a turn that started meanwhile must not get the follow-up as its reply
+    if (decision.action === 'ask') {
+      const now = await within(ctx.session.get(session, 1), ENGINE_WAIT_MS, 'session/get');
+      if (now?.running || (now?.queued?.length ?? 0) > 0) decision = { action: 'skip', reason: 'another turn started during the model check' };
     }
   }
   if (decision.action === 'skip') {
@@ -75,7 +88,7 @@ async function check(data: Record<string, unknown>, ctx: Context): Promise<void>
   memos.set(session, { asks: memo.asks + 1 });
   ctx.log(`turn-report: ${session} asks for ${decision.check.missing.join(', ')} (${memo.asks + 1}/${cfg.maxAsks})`);
   try {
-    await ctx.session.send(session, decision.prompt);
+    await within(ctx.session.send(session, decision.prompt), ENGINE_WAIT_MS, 'session/act');
   } catch (e) {
     ctx.log(`turn-report: sending the follow-up failed: ${(e as Error).message}`);
   }

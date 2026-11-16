@@ -22,11 +22,12 @@ acpira 只會載入資料目錄 `plugins/<id>/` 底下的使用者外掛（預�
 
 外掛只使用 runtime 的兩個事件和一個 session API，不註冊任何 hook：
 
-- `turn.started`：使用者自己的新請求（`origin` 是 `user` 或 `goal`，而且不是外掛自己送的追問）會把追問次數歸零。
+- `turn.started`：使用者自己的新請求會把追問次數歸零，包括 `origin` 是 `user` 的訊息，以及 `goal`（dock 上的 goal 控制）。外掛自己送的追問不算新請求；goal 自動續跑（`goalcontinue`）也不算。
 - `turn.ended`：只看 `stop: "end_turn"` 而且沒有錯誤的回合。等 0.6 秒後用 `session/get` 讀回 session，再交給 `report.ts` 判斷：
-  - 範圍是「最後一則非自動的使用者訊息」之後的所有 agent 回合，所以 workspace gate 的自動追問、Retry 之後的 continue 都算同一個請求。
-  - 只要有 `edit`、`delete`、`move` 或 `execute` 類的工具呼叫成功（失敗或取消的不算），就算有動手。純唯讀的指令（`git status`、`ls`、`rg`、`Get-ChildItem` 等，而且沒有重新導向寫入檔案）預設不算。
-  - 「最後的回覆」是最後一個 agent 回合中，最後一個工具呼叫之後的文字。若 agent 有標記 `phase: "final"`（例如 Codex），就只看 final 的部分。
+  - 範圍從「開始一個請求的使用者回合」算起，也就是非自動的使用者訊息，或 dock 的 goal 控制（`autoReason: "goal"` 且不是 `goalContinue`）。workspace gate 的自動追問、Retry、帳號切換之後的 continue、goal 續跑，都算在同一個請求裡。
+  - acpira 超過 context 門檻時自動送出的 `/compact`（`auto: true` 且沒有 `autoReason`）連同它的回合都會排除：它不是 agent 的工作，也沒有收尾回報。原請求的回合結束時，若 compact 已經開始跑，那次判斷會被跳過；compact 結束時會再判斷一次原請求，使用的仍是原請求最後的回覆。
+  - 只要有 `edit`、`delete`、`move` 或 `execute` 類的工具呼叫成功（失敗或取消的不算），就算有動手。純唯讀的指令預設不算：指令會依照 shell 的規則切段，切段時尊重引號；每一段都必須在唯讀清單上（`git status`、`git -C x log`、`rg`、`sed -n`、`jq`、`gh pr view`、`sort`、`Get-Content | Select-Object` 等），而且引號外不能有寫入檔案的重新導向，也不能有 `$(…)` 或反引號。`find -delete`、`sed -i`、`git branch -D` 這類寫入用的參數，以及 `env X=1` 之後接的指令，也都會另外檢查。
+  - 「最後的回覆」是最後一個 agent 回合中，最後一個工具呼叫之後的文字。其中若有標記 `phase: "final"` 的部分（例如 Codex），就只看那些。最後一個工具呼叫之前的 `final` 不算，因為 detached 續跑時，引擎會把上一段的收尾標成 final（`queue.rs` 的 `mark_reply_final`）。
 - 需要追問時，用 `session/act` 的 `send` 送出一則以 `[turn-report]` 開頭的訊息。訊息會列出缺少的部分，也會附上偵測到的檔案與指令，方便 agent 回想。
 
 ### 為什麼不用 `hooks.afterTurn`
@@ -47,7 +48,8 @@ acpira 只會載入資料目錄 `plugins/<id>/` 底下的使用者外掛（預�
 - 三個部分各有一組正規表示式（不分大小寫），涵蓋繁體中文、英文，也包含部分簡體字。任一條命中就算涵蓋。比對前會先去掉 fenced code block，避免程式碼裡的 `TODO` 被當成回報。
   - 做了哪些事：例如「修改了」「新增」「變更」「完成」、`changed` / `updated` / `ran`，或出現檔案路徑、常見副檔名的檔名。
   - 為什麼：例如「因為」「為了」「原因」「避免」「確保」、`because` / `so that` / `in order to`。
-  - 沒做完／沒驗證：例如「未完成」「尚未」「沒驗證」「限制」「後續」，也接受「都已完成」「沒有遺留」、`nothing left` / `all tests passed` 這類「全部完成」的明確說法。
+  - 沒做完／沒驗證：例如「未完成」「尚未」「沒驗證」「無法驗證」「沒跑」「限制」「後續」、`haven't` / `unable to` / `not yet`，也接受「都已完成」「沒有遺留」、`nothing left` / `all tests passed` 這類「全部完成」的明確說法。
+- 回覆超過 20,000 字元時，只看開頭與結尾各 10,000 字元。路徑規則只從字詞的開頭比對，所以長字串的比對成本是線性的。
 - 預設三項都要有才算通過。回覆長度達到 800 字元以上時，有兩項就算通過，因為長篇回報通常已經交代清楚。
 - 設計原則是寧可少擋：只要有一點跡象就算涵蓋。
 
@@ -57,7 +59,8 @@ acpira 只會載入資料目錄 `plugins/<id>/` 底下的使用者外掛（預�
 - **不該擋卻擋（追問）：**
   - 回報寫在程式碼區塊或表格裡，或改用其他語言、少見的說法（例如只寫「理由：無」以外的同義詞），可能被判成缺少。
   - 回報寫在工具呼叫之前，之後又跑了一個工具，最後只剩一句「好了」：外掛只看最後一個工具呼叫之後的文字。
-  - 被當成「有動手」的指令其實是唯讀的，但不在唯讀清單中（例如 `pnpm test`、`cargo check`），這時回合不會被當成純問答。
+  - 被當成「有動手」的指令其實是唯讀的，但不在唯讀清單中（例如 `pnpm test`、`cargo check`、`node -e …`、`gh api …`），這時回合不會被當成純問答。可以用 `readOnlyCommandsExtra` 補上。
+- **被當成唯讀而漏擋：** 唯讀清單上的指令本身也可能寫檔，例如 `awk` 腳本裡的 `print > file`（只擋明顯的寫法）、`git branch` 或 `git tag` 的少見寫入參數、`jq` / `yq` 的就地修改參數，以及 shell 函式或 alias。PowerShell 的 `-OutFile` 這類參數，與 `Get-*` 以外的 cmdlet 一樣不在清單上，會算成動手。
 - **看不到的工作：** 外部 CLI（Claude Code、Codex 等）的工具呼叫要透過 ACP 回報給 acpira 才看得到。agent 在子代理（subagent）裡做的事只算在委派那一列；若工具種類回報成 `other`（例如部分 MCP 工具），預設不算動手，可用 `workKinds` 調整。
 
 ### 選用：請模型再看一次
@@ -109,7 +112,9 @@ acpira 已經有固定可見、會隨進度更新的任務清單，所以這個�
 ## 限制
 
 - 追問是一般的使用者訊息（`session/act` 的 `send`），會以使用者訊息的外觀出現在對話中，也會經過專案的 `beforePrompt` hook。acpira 的外掛 API 沒有送出「自動訊息」的途徑。
-- 判斷是在回合結束後非同步進行。若使用者在這之前已經排了下一則訊息，或下一個回合已經開始，這次就不追問，以免打斷。
+- 判斷是在回合結束後非同步進行。若使用者在這之前已經排了下一則訊息，或下一個回合已經開始，這次就不追問，以免打斷。開啟模型複查時，送出追問前會再確認一次。
+- 專案的 workspace gate（`.agents/hooks.json` 的 afterTurn）還在決定時，session 看起來是閒置的（`running` 為 false），所以追問可能先排進佇列。gate 若擋下，會先送 gate 自己的追問，外掛的追問排在後面。
+- 對引擎的每個請求都有逾時（`session/get`、`session/act` 15 秒，`model/generate` 60 秒），引擎不回應時這次判斷就放棄，不會卡住同一個 session 之後的判斷。
 - 追問次數只存在記憶體中。外掛重新啟動（升級、停用後再啟用、acpira 重開）後會歸零，最壞情況是同一個請求多追問一次。
 - 只看 acpira 記錄到的工具呼叫，看不到 agent 在 ACP 之外做的事。
 - 外掛無法知道使用者自訂的規則；三件事的定義是固定的，只能透過 `sections` 調整判斷用的規則。
@@ -120,13 +125,17 @@ acpira 已經有固定可見、會隨進度更新的任務清單，所以這個�
 
 - `turn-report check`：直接測 `report.ts`，包括該放行、該追問、追問上限、純問答回合、中英文回覆、設定與選用的模型判斷。
 - `turn-report process`：用 esbuild 把 `main.ts` 照引擎啟動 `runtime.main` 的方式包起來（SDK 的 `start`），扮演引擎那一端的 JSON-RPC，驗證「問答不追問 → 動手沒回報時追問一次 → 追問的回覆仍不完整也不再追問 → 新請求重新計數」。
-- `turn-report in the sidecar`：把外掛裝進暫存 home，用 Rust sidecar 與假 agent（`hook-turn:shell=…`）跑完整流程。引擎要求外掛行程在 10 秒內回應 `initialize`（`runtime.rs` 的 `INIT_TIMEOUT`），在 Node 啟動很慢的機器上會因此失敗，既有的 `test/pluginRpc.test.ts` 也會一樣失敗。
+- `turn-report in the sidecar`：把外掛裝進暫存 home，用 Rust sidecar 與假 agent（`hook-turn:shell=…`）跑完整流程。**預設略過**，設 `ACPIRA_TURN_REPORT_E2E=1` 才會跑。目前在 Windows 上跑不通，原因有兩個，都不在這個外掛：
+  - 啟用任何 runtime 外掛（包括最小的外掛）之後，第一個 prompt 一送出，`main` 的 sidecar 就 stack overflow（exit code `0xC00000FD`）。沒有外掛時正常。這是引擎問題，另外處理。
+  - 在 Node 啟動很慢的機器上，外掛行程來不及在引擎的 10 秒 `INIT_TIMEOUT`（`runtime.rs`）內回應 `initialize`，啟用就會失敗。既有的 `test/pluginRpc.test.ts` 在同樣的機器上也會失敗。
 
 ```sh
 ACPIRA_SIDECAR_BIN=<已編好的 acpira> pnpm exec vitest run test/plugin-turn-report.test.ts
 ```
 
 ## 手動驗證
+
+注意：在 `main` 的引擎上，只要啟用任何 runtime 外掛，送出 prompt 時 sidecar 就可能 stack overflow（Windows 上 exit code `0xC00000FD`，見「測試」）。這個引擎問題修好之前，下列步驟可能在第 2 步就讓引擎結束。
 
 1. 用暫存 home 啟動，避免動到真正的 `~/.acpira`：桌面版的瀏覽器測試模式 `acpira-desktop-tauri --ws <port> --token <T> --home <暫存目錄>`（從 repo 根目錄執行），或 `pnpm harness`（先 `pnpm build`，加上 `--home <暫存目錄>`）。把本資料夾複製到 `<暫存目錄>/plugins/turn-report/`，再到 Settings → Plugins 啟用。
 2. 開一個 session，請 agent 做一件會改檔或跑指令的小事，並要求它「最後只回『好了』」。

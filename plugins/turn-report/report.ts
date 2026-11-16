@@ -48,9 +48,10 @@ const DONE_PATTERNS = [
   '[變变]更', '改[動动]', '[異异][動动]', '[檔档]案', '文件', '指令', '命令',
   '\\b(?:changed|modified|updated|added|created|removed|deleted|renamed|implemented|fixed|refactored|wrote|ran|executed|installed|committed)\\b',
   '\\b(?:changes|summary|what i did|done)\\b',
-  // A file path or a file name with a common extension
-  '(?:[\\w.-]+/)+[\\w.-]+',
-  '\\b[\\w-]+\\.(?:ts|tsx|js|jsx|mjs|cjs|json|jsonc|md|rs|py|go|java|kt|swift|css|scss|html|toml|yaml|yml|sh|ps1|txt|lock|sql)\\b',
+  // A file path or a file name with a common extension. Each starts only where a word starts, so a long run of word
+  // characters is scanned once rather than from every position in it
+  '(?<![\\w.-])[\\w.-]+/[\\w.-]',
+  '(?<![\\w-])[\\w-]+\\.(?:ts|tsx|js|jsx|mjs|cjs|json|jsonc|md|rs|py|go|java|kt|swift|css|scss|html|toml|yaml|yml|sh|ps1|txt|lock|sql)\\b',
 ];
 
 const WHY_PATTERNS = [
@@ -62,16 +63,33 @@ const WHY_PATTERNS = [
 const TODO_PATTERNS = [
   '未完成', '[沒没]做', '[沒没]有做', '尚未', '[還还][沒没]', '[還还]有', '未[驗验][證证]', '[沒没][驗验][證证]', '[沒没]有[驗验][證证]',
   '未[測测]', '[沒没][測测]', '[沒没]有[測测]', '待[辦办]', '待[確确][認认]', '後續', '后续', '限制', '風險', '风险', '注意', '已知問題', '已知问题',
-  '剩下', '遺留', '遗留', '下一步', '都已', '全部(?:完成|[驗验][證证]|通過|通过)', '[沒没]有(?:其他)?(?:未完成|遺留|遗留|待辦|待办)',
-  '\\b(?:todo|not yet|unverified|untested|not (?:been )?(?:tested|verified|run|checked)|remaining|left to|follow[- ]?ups?|next steps?|limitations?|caveats?|known issues?|risks?|did not|didn\'t|could not|couldn\'t|pending|open questions?|nothing (?:left|remaining|else)|all (?:\\w+ )?(?:passed|verified|done))\\b',
+  '剩下', '遺留', '遗留', '下一步', '都已', '無法', '无法', '[沒没]跑', '未跑', '[沒没]辦法', '[沒没]办法', '[還还]不能', '全部(?:完成|[驗验][證证]|通過|通过)', '[沒没]有(?:其他)?(?:未完成|遺留|遗留|待辦|待办)',
+  '\\b(?:todo|not yet|unverified|untested|not (?:been )?(?:tested|verified|run|checked)|remaining|left to|follow[- ]?ups?|next steps?|limitations?|caveats?|known issues?|risks?|did not|didn\'t|could not|couldn\'t|have not|haven\'t|has not|hasn\'t|was not able|wasn\'t able|unable to|cannot|can\'t|pending|open questions?|nothing (?:left|remaining|else)|all (?:\\w+ )?(?:passed|verified|done))\\b',
 ];
 
+// One command segment (after `env X=1`, `git -C dir` and the like are taken off), anchored at its start
 const READ_ONLY_COMMANDS = [
-  'git\\s+(?:status|log|diff|show|branch|remote|rev-parse|blame|grep|ls-files|describe|config\\s+--get)\\b',
-  '(?:ls|dir|cat|type|head|tail|less|more|pwd|cd|echo|printf|find|grep|egrep|rg|ag|fd|tree|wc|which|where|whoami|env|printenv|stat|file|du|df|date|uname|hostname)\\b',
-  '(?:node|npm|pnpm|yarn|python3?|cargo|rustc|go|java)\\s+(?:-v|-V|--version)\\b',
-  '(?:npm|pnpm)\\s+(?:ls|list|why|view|outdated)\\b',
-  '(?:Get-ChildItem|Get-Content|Get-Item|Get-Location|Select-String|Test-Path|Resolve-Path|Write-Output|Write-Host)\\b',
+  'git\\s+(?:status|log|diff|show|blame|grep|ls-files|ls-tree|describe|rev-parse|rev-list|shortlog|cat-file|merge-base|config\\s+(?:--get|--list|-l)\\b)',
+  'git\\s+(?:branch|remote|tag|stash\\s+list|worktree\\s+list)\\b',
+  '(?:ls|dir|cat|type|head|tail|less|more|nl|pwd|cd|pushd|popd|echo|printf|find|grep|egrep|fgrep|rg|ag|fd|tree|wc|which|where|whoami|env|printenv|stat|file|du|df|date|uname|hostname|ps|sort|uniq|cut|tr|column|diff|cmp|comm|jq|yq|sed|awk|basename|dirname|realpath|readlink|test|true|sleep)\\b',
+  'gh\\s+(?:pr|issue|run|repo|release|workflow)\\s+(?:view|list|status|diff|checks)\\b',
+  'gh\\s+(?:status|auth\\s+status)\\b',
+  '(?:node|npm|pnpm|yarn|python3?|py|cargo|rustc|rustup|go|java|dotnet|gh|git)\\s+(?:-v|-V|--version)\\b',
+  '(?:npm|pnpm|yarn)\\s+(?:ls|list|why|view|info|outdated|config\\s+get)\\b',
+  'cargo\\s+(?:tree|metadata)\\b',
+  '(?:Get-[A-Za-z]+|Select-String|Select-Object|Where-Object|Sort-Object|Measure-Object|Format-Table|Format-List|Out-String|ConvertFrom-Json|ConvertTo-Json|Test-Path|Resolve-Path|Split-Path|Join-Path|Write-Output|Write-Host|Set-Location)\\b',
+];
+
+// What turns a command on the list into one that writes or runs something else; checked on every segment, whatever
+// the configured list says
+const WRITE_HINTS = [
+  /^find\b.*\s-(?:delete|exec|execdir|ok|okdir|fprint\w*|fls)\b/i,
+  /^(?:sed|perl)\b.*\s(?:-i\S*|--in-place\S*)/i,
+  /^awk\b.*(?:\bsystem\s*\(|\bprint[^|]*>)/i,
+  /^git\s+branch\b.*\s(?:-[dDmMcCfu]\b|--delete|--move|--copy|--force|--set-upstream\S*|--unset-upstream|--edit-description)/,
+  /^git\s+remote\s+(?:add|remove|rm|rename|set-url|set-head|set-branches|prune|update)\b/i,
+  /^git\s+tag\s+(?!-l\b|--list\b|-n\b)\S/i,
+  /^(?:sort|yq|jq)\b.*\s(?:-o|--output|-i|--in-place)\b/i,
 ];
 
 export const DEFAULT_PROMPT = [
@@ -193,6 +211,9 @@ export interface UserTurnView {
   role: 'user';
   text?: string;
   auto?: boolean;
+  // Why Acpira sent it: absent on an automatic turn means the over-threshold /compact (packages/shared/transcript.ts)
+  autoReason?: string;
+  goalContinue?: boolean;
 }
 export interface AgentTurnView {
   role: 'agent';
@@ -220,35 +241,119 @@ export interface Work {
 const isTool = (b: BlockView): b is ToolBlockView => b.type === 'tool_call';
 const isText = (b: BlockView): b is TextBlockView => b.type === 'text';
 
-// A redirect into anything but the null device writes a file
-const REDIRECT = /(?<![\d&])>{1,2}\s*([^\s&|;]+)/g;
 const NULL_TARGETS = new Set(['/dev/null', '$null', 'nul']);
 
-/** Whether a command only looks around: every segment matches a read-only pattern and nothing is redirected into a file */
-export function readOnlyCommand(command: string, config: ReportConfig): boolean {
-  for (const m of command.matchAll(REDIRECT)) {
-    const target = (m[1] ?? '').replace(/^["']|["']$/g, '').toLowerCase();
-    if (!target.startsWith('&') && !NULL_TARGETS.has(target)) return false;
-  }
-  const segments = command.split(/&&|\|\||;|\|/).map(s => s.trim()).filter(Boolean);
-  if (segments.length === 0) return false;
-  return segments.every(seg => config.readOnlyCommands.some(src => regex(src, true)?.test(seg) ?? false));
+export interface ParsedCommand {
+  // The pieces between `&&`, `||`, `;`, `|`, `&` and line breaks, outside quotes
+  segments: string[];
+  // A `>` / `>>` outside quotes into anything but the null device or another descriptor
+  writes: boolean;
+  // `$(...)` or backticks outside single quotes: another command runs inside this one
+  substitutes: boolean;
 }
 
+/** A shell command split the way a shell would, as far as telling reads from writes needs: quotes are honoured */
+export function parseCommand(command: string): ParsedCommand {
+  const segments: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let writes = false;
+  let substitutes = false;
+  const end = () => {
+    if (current.trim()) segments.push(current.trim());
+    current = '';
+  };
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i]!;
+    if (quote) {
+      if (c === quote) quote = null;
+      else if (quote === '"' && (c === '`' || (c === '$' && command[i + 1] === '('))) substitutes = true;
+      current += c;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      current += c;
+      continue;
+    }
+    if (c === '`' || (c === '$' && command[i + 1] === '(')) substitutes = true;
+    if (c === '\n' || c === ';') {
+      end();
+      continue;
+    }
+    if (c === '&' || c === '|') {
+      // `>&2`, `2>&1` and `&>` are redirects, handled below
+      if (c === '&' && (command[i - 1] === '>' || command[i + 1] === '>')) {
+        current += c;
+        continue;
+      }
+      if (command[i + 1] === c) i++;
+      end();
+      continue;
+    }
+    if (c === '>') {
+      let j = i + 1;
+      if (command[j] === '>') j++;
+      // `>&2`: into another descriptor
+      const descriptor = command[j] === '&';
+      while (command[j] === ' ' || command[j] === '\t') j++;
+      let target = '';
+      while (j < command.length && !/[\s;&|<>]/.test(command[j]!)) target += command[j++];
+      const bare = target.replace(/^["']|["']$/g, '').toLowerCase();
+      if (!descriptor && !NULL_TARGETS.has(bare)) writes = true;
+      current += command.slice(i, j);
+      i = j - 1;
+      continue;
+    }
+    current += c;
+  }
+  end();
+  return { segments, writes, substitutes };
+}
+
+// `VAR=1 cmd`, `env VAR=1 cmd`, `git -C dir cmd`, `git --no-pager cmd`: the command that actually runs
+function core(segment: string): string {
+  const s = segment.replace(/^(?:env\s+(?=\w+=))?(?:\w+=(?:"[^"]*"|'[^']*'|\S*)\s+)+/, '');
+  return s.replace(/^git((?:\s+(?:-C\s+(?:"[^"]*"|'[^']*'|\S+)|-c\s+\S+|--no-pager|--git-dir=\S+|--work-tree=\S+|-P))+)(?=\s)/, 'git');
+}
+
+/** Whether a command only looks around: every segment is on the read-only list, and nothing writes into a file */
+export function readOnlyCommand(command: string, config: ReportConfig): boolean {
+  const parsed = parseCommand(command);
+  if (parsed.writes || parsed.substitutes || parsed.segments.length === 0) return false;
+  return parsed.segments.every(seg => {
+    const run = core(seg);
+    if (WRITE_HINTS.some(re => re.test(run))) return false;
+    return config.readOnlyCommands.some(src => regex(src, true)?.test(run) ?? false);
+  });
+}
+
+// The /compact Acpira sends on its own past the context threshold: automatic, with no reason (`prompt.rs`, Origin::Compact)
+const isCompaction = (t: UserTurnView) => t.auto === true && !t.autoReason;
+// Where a request begins: a message of the user's own, or a goal control from the dock (an automatic turn with reason
+// `goal` that is not the goal carrying on)
+const startsRequest = (t: UserTurnView) => t.auto !== true || (t.autoReason === 'goal' && t.goalContinue !== true);
+
 /**
- * What the request the user last made has done so far: the agent turns after the last user turn that was not sent
- * automatically (gate follow-ups and continues belong to the request before them)
+ * What the user's current request has done so far: the agent turns from the last turn that starts a request on. Gate
+ * follow-ups, continues and the goal carrying on belong to it; the automatic /compact's turns are left out, since they
+ * are no work of the agent's and close on no report
  */
 export function summarizeWork(turns: TurnView[], config: ReportConfig): Work {
   let start = 0;
   for (let i = turns.length - 1; i >= 0; i--) {
     const t = turns[i];
-    if (t?.role === 'user' && t.auto !== true) {
+    if (t?.role === 'user' && startsRequest(t)) {
       start = i + 1;
       break;
     }
   }
-  const agentTurns = turns.slice(start).filter((t): t is AgentTurnView => t.role === 'agent');
+  const agentTurns: AgentTurnView[] = [];
+  let compacting = false;
+  for (const t of turns.slice(start)) {
+    if (t.role === 'user') compacting = isCompaction(t);
+    else if (!compacting) agentTurns.push(t);
+  }
   const files = new Set<string>();
   const commands: string[] = [];
   let worked = false;
@@ -269,13 +374,18 @@ export function summarizeWork(turns: TurnView[], config: ReportConfig): Work {
   return { worked, files: [...files], commands, reply: closingText(agentTurns.at(-1)) };
 }
 
+// The prose after the turn's last tool call; of it, the parts marked `final` when there are any. Only the tail counts:
+// a detached continuation marks the stretch it continues from as final too (`queue.rs` mark_reply_final), so a `final`
+// before the last tool call is an older closing
 function closingText(turn: AgentTurnView | undefined): string {
   const blocks = turn?.blocks ?? [];
-  const finals = blocks.filter(isText).filter(b => b.phase === 'final');
-  if (finals.length > 0) return finals.map(b => b.markdown ?? '').join('\n\n').trim();
   let lastTool = -1;
-  blocks.forEach((b, i) => { if (isTool(b)) lastTool = i; });
-  return blocks.slice(lastTool + 1).filter(isText).map(b => b.markdown ?? '').join('\n\n').trim();
+  blocks.forEach((b, i) => {
+    if (isTool(b)) lastTool = i;
+  });
+  const tail = blocks.slice(lastTool + 1).filter(isText);
+  const finals = tail.filter(b => b.phase === 'final');
+  return (finals.length > 0 ? finals : tail).map(b => b.markdown ?? '').join('\n\n').trim();
 }
 
 // ---- the check ----
@@ -286,6 +396,8 @@ export interface Check {
   pass: boolean;
 }
 
+const MATCH_MAX_CHARS = 20_000;
+
 /** Fenced code blocks say nothing about the work's report (a `TODO` in a snippet is not one) */
 export function prose(markdown: string): string {
   return markdown.replace(/^(```|~~~)[^\n]*\n[\s\S]*?^\1[^\n]*$/gm, ' ');
@@ -293,7 +405,8 @@ export function prose(markdown: string): string {
 
 /** Whether a reply covers the three parts; lenient by design: any pattern of a section covers it */
 export function checkReply(reply: string, config: ReportConfig): Check {
-  const text = prose(reply);
+  // A report sits at the start or the end; a very long reply is read there only, which keeps every pattern's cost bounded
+  const text = prose(reply.length > MATCH_MAX_CHARS ? `${reply.slice(0, MATCH_MAX_CHARS / 2)}\n${reply.slice(-MATCH_MAX_CHARS / 2)}` : reply);
   const covered = { done: false, why: false, todo: false } as Record<SectionKey, boolean>;
   for (const key of SECTION_KEYS) {
     covered[key] = config.sections[key].patterns.some(src => regex(src)?.test(text) ?? false);
@@ -368,9 +481,10 @@ export function followUp(config: ReportConfig, missing: SectionKey[], work: Work
   if (work.files.length > 0) parts.push(`本回合偵測到的檔案：${list(work.files)}`);
   if (work.commands.length > 0) parts.push(`本回合偵測到的指令：${list(work.commands)}`);
   const text = config.prompt
-    .replaceAll('{marker}', config.marker)
-    .replaceAll('{missing}', missing.map(k => config.sections[k].label).join('、'))
-    .replaceAll('{work}', parts.join('\n'));
+    // Functions, not strings: a replacement string reads `$&`, `$'` and `$$` in a command or label as patterns
+    .replaceAll('{marker}', () => config.marker)
+    .replaceAll('{missing}', () => missing.map(k => config.sections[k].label).join('、'))
+    .replaceAll('{work}', () => parts.join('\n'));
   const trimmed = text.replace(/\n{3,}/g, '\n\n').trim();
   // The marker is how the plugin knows its own message; a template that drops it still starts with it
   return trimmed.startsWith(config.marker) ? trimmed : `${config.marker} ${trimmed}`;
