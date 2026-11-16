@@ -68,11 +68,13 @@ const STEP = 'disabled:pointer-events-none disabled:opacity-40';
 // and with no column beside the sheet its header starts after the row (--title-w). It moves the window like a title bar.
 // A narrow window (the column a page over it) keeps the lights and the toggle only, so the header has the room; back and
 // forward stay on ⌘[ / ⌘] there. The toggle reads as pressed while that page is open
-export function TitleRow({ onBack, onForward, column }: {
+export function TitleRow({ onBack, onForward, column, inbox }: {
   onBack?: () => void;
   onForward?: () => void;
   // The column's toggle: hide / show a docked column, open / close the list page of a narrow window
   column?: { open: boolean; drawer: boolean; onToggle: () => void };
+  // The chat's inbox bell (chat/AttentionInbox.tsx), last so the buttons before it keep their places; the settings page has none
+  inbox?: ReactNode;
 }) {
   const label = column && t(column.open ? 'desktop.hideSidebar' : 'desktop.showSidebar');
   return <>
@@ -88,6 +90,7 @@ export function TitleRow({ onBack, onForward, column }: {
         </IconButton>
       )}
       {pageCaption && <AppMenus />}
+      {inbox}
     </div>
     {pageCaption && <WindowCaption />}
   </>;

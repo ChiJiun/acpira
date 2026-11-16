@@ -30,14 +30,16 @@
   /* The column foot's and the settings rail's bottom inset (AppMenu, settings/Nav.tsx): a pixel under the sheet's, since
      the sheet's 1 px ring is drawn outside its box; a row's fill (hover, the current page) then ends on the ring's outer edge */
   --foot-bottom: calc(var(--sheet-inset) - 1px);
-  --title-w: calc(max(var(--gap), var(--lights-w)) + 3 * var(--ctl) + 4px + var(--gap));
+  /* The inbox bell at the row's end (chat/AttentionInbox.tsx), with its 2 px step: set below while the row carries it */
+  --title-inbox-w: 0px;
+  --title-w: calc(max(var(--gap), var(--lights-w)) + 3 * var(--ctl) + 4px + var(--title-inbox-w) + var(--gap));
   /* The edge a narrow window's list page casts over the chat as it slides */
   --page-edge: 0 0 40px rgb(0 0 0 / 0.45);
 }
 .acp-shell[data-desktop][data-theme="light"] { --canvas: color-mix(in srgb, var(--bg-0) 92%, #000); --page-edge: 0 0 32px rgb(0 0 0 / 0.14); }
 /* A narrow window (data-narrow): the title row keeps the lights and the column's toggle only, so the header gains two
    buttons' width. Scoped to the header/tabs/rail consumers so crossing the tier never invalidates inherited vars on the whole shell. */
-.acp-shell[data-desktop][data-narrow] :is([data-sheet-header], [data-stage-tabs], [data-settings-rail]) { --title-w: calc(max(var(--gap), var(--lights-w)) + var(--ctl) + var(--gap)); }
+.acp-shell[data-desktop][data-narrow] :is([data-sheet-header], [data-stage-tabs], [data-settings-rail]) { --title-w: calc(max(var(--gap), var(--lights-w)) + var(--ctl) + var(--title-inbox-w) + var(--gap)); }
 /* The lights span x 17-77 (14 pt each, 9 pt apart on macOS 27); the first button after them leaves a breath of about 15 px
    to its icon */
 /* macOS: the header line is 40 px, so its controls get a breath above and below inside the sheet; the lights' centre
@@ -53,10 +55,11 @@
   --title-top: 0px;
   --caps-w: calc(3 * var(--caption-w) + var(--gap) - var(--sheet-inset) - var(--start-x));
   --title-menu-w: 0px;
-  --title-w: calc(var(--gap) + 3 * var(--ctl) + 4px + var(--title-menu-w) + var(--gap));
+  --title-w: calc(var(--gap) + 3 * var(--ctl) + 4px + var(--title-menu-w) + var(--title-inbox-w) + var(--gap));
 }
 .acp-shell[data-desktop][data-caption]:has(> [data-title-row] > [data-app-menus]) { --title-menu-w: calc(var(--ctl) + 2px); }
-.acp-shell[data-desktop][data-caption][data-narrow] :is([data-sheet-header], [data-stage-tabs], [data-settings-rail]) { --title-w: calc(var(--gap) + var(--ctl) + var(--title-menu-w) + var(--gap)); }
+.acp-shell[data-desktop]:has(> [data-title-row] > [data-inbox]) { --title-inbox-w: calc(var(--ctl) + 2px); }
+.acp-shell[data-desktop][data-caption][data-narrow] :is([data-sheet-header], [data-stage-tabs], [data-settings-rail]) { --title-w: calc(var(--gap) + var(--ctl) + var(--title-menu-w) + var(--title-inbox-w) + var(--gap)); }
 /* A sheet header that ends at the window's edge leaves the caption its room; beside a shown tool panel it does not */
 .acp-shell[data-desktop][data-caption]:not([data-layout="files"]):not([data-subagent-docked]) [data-sheet-header] { --sheet-trail: calc(var(--start-x) + var(--caps-w)); }
 .acp-shell[data-desktop][data-caption]:not([data-layout="files"]):has(> [data-tool-panel-wrap][data-shown]) [data-sheet-header] { --sheet-trail: var(--start-x); }
@@ -275,3 +278,17 @@
 }
 
 @keyframes acp-rail-open { from { width: 0; opacity: 0; } }
+
+/* The inbox bell's count (chat/AttentionInbox.tsx): a pill on the bell's upper right, in the strongest foreground like the
+   unread dot, amber like the waiting dot while a session waits on the user. Ringed in the title row's own ground so it
+   reads apart from the glyph under it */
+@layer components {
+  .inbox-badge {
+    position: absolute; top: 2px; right: 1px;
+    min-width: var(--icon); height: var(--icon); padding-inline: 3px; border-radius: 999px;
+    font-size: 10px; font-weight: 600; line-height: var(--icon); text-align: center; font-variant-numeric: tabular-nums;
+    color: var(--bg-0); background: var(--fg-strong); box-shadow: 0 0 0 1.5px var(--canvas, var(--bg-0));
+    pointer-events: none;
+  }
+  [data-inbox="urgent"] .inbox-badge { background: var(--warn); }
+}
