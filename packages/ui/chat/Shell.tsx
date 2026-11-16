@@ -62,6 +62,10 @@ import { droppedPathResolver, hostDragPaths, setWebviewState, webviewState } fro
 import { focusMainComposer, mainComposerEmpty, moveDraft } from './useComposerDraft';
 import { pendingQuickPermission } from './permissionOptions';
 import { nextAttentionSession, orderedSessions, stepSession } from './sessionNav';
+import { listedSessions, readRecent, seedSearch, takeSeed, touchRecent, type SearchSeed } from './attention';
+import { AttentionInbox } from './AttentionInbox';
+import { SessionSwitcher } from './SessionSwitcher';
+import { inWorkspace } from '@acpira/shared/settings';
 import { ChatFind, type ThreadSearchBridge } from './ChatFind';
 import { QuickOpen } from '../panel/QuickOpen';
 import { ProjectPick, StartPicker, usePresence } from './StartPage';
@@ -93,6 +97,14 @@ import { useSessionOutline } from '../plugins/outline';
 import { useReportLink } from './reportLink';
 import { SessionRail, SlotPieces } from '../plugins/Pieces';
 
+// The window's sessions in order of use, most recent first (chat/attention.ts touchRecent), for the switcher
+const RECENT_KEY = 'recentSessions';
+// The shell's modal dialogs. A key or menu command that toggles one of them leaves it alone while another is open,
+// rather than stacking a second over it
+const SWITCHER = '[data-session-switcher]';
+const QUICK_OPEN = '[data-quick-open]';
+const otherModal = (own: string) =>
+  [...document.querySelectorAll('[data-settings-dialog], [data-quick-open], [data-session-switcher]')].some(e => !e.matches(own));
 // What `fileStager` last read, by session and path (null: unreadable), kept for the page's life: a session switched
 // back to, or a fold opened again, shows it at once while the host checks the file again. Reads under way are shared
 const stagedFiles = new Map<string, string | null>();
@@ -774,7 +786,11 @@ export function Shell(p: ShellProps) {
   const newInCat = useCallback((category: string) => { on.newSession(folderAgent(p.cwd), category); closeDrawer(); }, [on.newSession, folderAgent, p.cwd, closeDrawer]);
   const toggleDrawer = useCallback(() => (drawerOpenNow.current ? closeDrawer() : openDrawer()), [closeDrawer, openDrawer]);
   const trail = useSessionHistory(desktop ? p.activeSessionId : undefined, id => p.sessions.some(s => s.id === id), id => on.selectSession(id));
-  const focusSearch = () => {
+  // The switcher's "search messages" row hands its query to the column's search field (SessionList searchSeed)
+  const [searchSeed, setSearchSeed] = useState<SearchSeed>();
+  const seedTaken = useCallback((seq: number) => setSearchSeed(cur => takeSeed(cur, seq)), []);
+  const focusSearch = (query?: string) => {
+    if (query !== undefined) setSearchSeed(cur => seedSearch(cur, query));
     const focus = () => sessionPanel.current?.querySelector<HTMLInputElement>('input')?.focus();
     // A narrow window has a drawer, not the docked column: the column's folded flag does not apply there
     if (!canDock) { if (drawerOpen) focus(); else openDrawer(); }
@@ -791,6 +807,37 @@ export function Shell(p: ShellProps) {
   const [chatFind, setChatFind] = useState<{ seq: number; query?: string }>();
   const [quickOpen, setQuickOpen] = useState(false);
   useEffect(() => setQuickOpen(false), [p.activeSessionId]);
+  // ⌘K: the session switcher. The engine keeps no order of use, so the window records the sessions it showed, most recent
+  // first, in its own state (kept across reloads)
+  const [switcher, setSwitcher] = useState(false);
+  const [recent, setRecent] = useState<string[]>(() => readRecent(webviewState(RECENT_KEY)));
+  useEffect(() => {
+    if (!p.activeSessionId || p.sample) return;
+    setRecent(prev => touchRecent(prev, p.activeSessionId!));
+  }, [p.activeSessionId, p.sample]);
+  useEffect(() => { if (!p.sample) setWebviewState(RECENT_KEY, recent); }, [recent, p.sample]);
+  const switcherOpen = useRef(false);
+  switcherOpen.current = switcher;
+  // Where the focus was before the switcher opened: closing it without going anywhere puts it back (the dialog's own
+  // return is off, ui/Dialog.tsx), so the composer takes the next keys again
+  const switcherReturn = useRef<HTMLElement | null>(null);
+  const closeSwitcher = useCallback((picked?: boolean) => {
+    switcherOpen.current = false;
+    setSwitcher(false);
+    const back = switcherReturn.current;
+    switcherReturn.current = null;
+    if (!picked && back?.isConnected) back.focus({ preventScroll: true });
+  }, []);
+  const openSwitcher = useCallback(() => {
+    if (p.sample) return;
+    if (switcherOpen.current) { closeSwitcher(); return; }
+    // Opening: keys typed before the field takes the focus must not reach the composer (or whatever held it)
+    const held = document.activeElement;
+    switcherReturn.current = held instanceof HTMLElement && held !== document.body ? held : null;
+    switcherReturn.current?.blur();
+    switcherOpen.current = true;
+    setSwitcher(true);
+  }, [p.sample, closeSwitcher]);
   const openChatFind = useCallback(() => {
     if (p.noProject || startPage || !p.turns.length) return;
     const sel = window.getSelection();
@@ -827,11 +874,11 @@ export function Shell(p: ShellProps) {
     if (!panel.closeActive(files)) postWindowControl('close');
   }, [files]);
   const keys = useRef({
-    newIn, addProject, focusSearch, leftSide, rightSide, back: trail.back, forward: trail.forward,
+    newIn, addProject, focusSearch, openSwitcher, leftSide, rightSide, back: trail.back, forward: trail.forward,
     toggleTerminal, openChanges, toggleBrowser, toggleQuickOpen, closePanelOrWindow,
   });
   keys.current = {
-    newIn, addProject, focusSearch, leftSide, rightSide, back: trail.back, forward: trail.forward,
+    newIn, addProject, focusSearch, openSwitcher, leftSide, rightSide, back: trail.back, forward: trail.forward,
     toggleTerminal, openChanges, toggleBrowser, toggleQuickOpen, closePanelOrWindow,
   };
   const openSettings = p.onOpenSettings;
@@ -844,7 +891,7 @@ export function Shell(p: ShellProps) {
     running: p.running, turns: p.turns, subagents: p.subagents, hasQuestion: !!question,
     overlayInspect, chatFindOpen: !!chatFind,
     selectSession: (id: string) => { on.selectSession(id); closeDrawer(); },
-    stop: on.stop, permission: on.permission, openChatFind, focusSearch, openSettings,
+    stop: on.stop, permission: on.permission, openChatFind, openSwitcher, openSettings,
     hasSessionPanel: position !== 'hidden',
   });
   shellKeys.current = {
@@ -853,7 +900,7 @@ export function Shell(p: ShellProps) {
     running: p.running, turns: p.turns, subagents: p.subagents, hasQuestion: !!question,
     overlayInspect, chatFindOpen: !!chatFind,
     selectSession: (id: string) => { on.selectSession(id); closeDrawer(); },
-    stop: on.stop, permission: on.permission, openChatFind, focusSearch, openSettings,
+    stop: on.stop, permission: on.permission, openChatFind, openSwitcher, openSettings,
     hasSessionPanel: position !== 'hidden',
   };
   useEffect(() => {
@@ -862,7 +909,7 @@ export function Shell(p: ShellProps) {
       if (imeKey(e) || e.defaultPrevented) return;
       const cur = shellKeys.current;
       const target = e.target instanceof HTMLElement ? e.target : null;
-      const inDialog = !!document.querySelector('[data-settings-dialog], [data-quick-open], [role="menu"]');
+      const inDialog = !!document.querySelector('[data-settings-dialog], [data-quick-open], [data-session-switcher], [role="menu"]');
       const inXterm = !!target?.closest('.xterm');
 
       if (!inDialog && cur.openSettings && hitShortcut(e, 'openShortcuts')) {
@@ -877,9 +924,11 @@ export function Shell(p: ShellProps) {
         return;
       }
 
+      // ⌘K (desktop: the shell's own keys below): the session switcher, which reaches the column's search too. An IDE
+      // whose session list folds into the header leaves the key to the host (VS Code's ⌘K chords)
       if (!inDialog && !desktop && cur.hasSessionPanel && hitShortcut(e, 'searchSessions')) {
         e.preventDefault();
-        cur.focusSearch();
+        cur.openSwitcher();
         return;
       }
 
@@ -969,9 +1018,9 @@ export function Shell(p: ShellProps) {
       else if (hitShortcut(e, 'openChanges')) keys.current.openChanges();
       else if (hitShortcut(e, 'toggleBrowser')) keys.current.toggleBrowser();
       else if (hitShortcut(e, 'newSession')) keys.current.newIn();
-      else if (hitShortcut(e, 'searchSessions')) keys.current.focusSearch();
+      else if (hitShortcut(e, 'searchSessions')) { if (!otherModal(SWITCHER)) keys.current.openSwitcher(); }
       else if (hitShortcut(e, 'toggleSidebar')) keys.current.leftSide();
-      else if (hitShortcut(e, 'quickOpen')) keys.current.toggleQuickOpen();
+      else if (hitShortcut(e, 'quickOpen')) { if (!otherModal(QUICK_OPEN)) keys.current.toggleQuickOpen(); }
       else if (hitShortcut(e, 'closeTab')) keys.current.closePanelOrWindow();
       else if (on.pickFolder && hitShortcut(e, 'openFolder')) keys.current.addProject();
       else if (openSettings && hitShortcut(e, 'openSettings')) openSettings();
@@ -986,9 +1035,9 @@ export function Shell(p: ShellProps) {
   // The menu bar's commands do what the shortcuts do (settings is App's: it switches the page)
   const runCommand = useCallback((command: ShellCommand) => {
     if (command === 'newSession') keys.current.newIn();
-    else if (command === 'search') keys.current.focusSearch();
+    else if (command === 'search') { if (!otherModal(SWITCHER)) keys.current.openSwitcher(); }
     else if (command === 'openFolder') keys.current.addProject();
-    else if (command === 'quickOpen') keys.current.toggleQuickOpen();
+    else if (command === 'quickOpen') { if (!otherModal(QUICK_OPEN)) keys.current.toggleQuickOpen(); }
     else if (command === 'close') keys.current.closePanelOrWindow();
     else if (command === 'sidebar') keys.current.leftSide();
     else if (command === 'toolPanel') keys.current.rightSide();
@@ -1052,6 +1101,14 @@ export function Shell(p: ShellProps) {
     ? <AppMenu onOpenSettings={p.onOpenSettings} onOpenExternal={on.openExternal} quick={p.quickSettings} agentUpdate={agentUpdate} />
     : undefined), [desktop, p.onOpenSettings, on.openExternal, p.quickSettings, agentUpdate]);
   const openSession = useCallback((id: string) => { on.selectSession(id); closeDrawer(); }, [on.selectSession, closeDrawer]);
+  // What the switcher reaches: every project in the desktop app, the list's scope in an IDE (the session on screen always)
+  const shownId = p.pendingSessionId ?? p.activeSessionId;
+  // The desktop app's inbox and switcher reach what its session column lists: a removed project's sessions stay out
+  const columnSessions = useMemo(() => desktop ? listedSessions(p.sessions, p.categories) : p.sessions, [desktop, p.sessions, p.categories]);
+  const switcherSessions = !switcher ? [] : desktop
+    ? (columnSessions.some(s => s.id === shownId) ? columnSessions : columnSessions.concat(p.sessions.filter(s => s.id === shownId)))
+    : p.sessionScope === 'all' || !p.workspace ? p.sessions
+    : p.sessions.filter(s => inWorkspace(s, p.workspace!) || s.id === shownId);
   const sessionsPanel = (
     <SessionList
       fill
@@ -1091,6 +1148,8 @@ export function Shell(p: ShellProps) {
       onMarkAllRead={on.markAllRead}
       chats={desktop ? p.chats : undefined}
       onNewChat={desktop && p.chats ? newChat : undefined}
+      searchSeed={searchSeed}
+      onSeedTaken={seedTaken}
     />
   );
 
@@ -1647,6 +1706,8 @@ export function Shell(p: ShellProps) {
                 searchFiles={on.searchFiles} openEditor={openInEditor} openPlan={openPlanInEditor} shareSelection={p.shareEditorSelection} context={contextTab} />)}
           {/* Last, so it stays over the drawer of a narrow window. The files layout's left column is the explorer */}
           {desktop && <TitleRow onBack={trail.back} onForward={trail.forward}
+            inbox={!p.sample && <AttentionInbox sessions={columnSessions} activeId={p.pendingSessionId ?? p.activeSessionId}
+              categories={p.categories} chats={p.chats} onSelect={openSession} />}
             column={files
               ? { open: !explorerHidden, drawer: false, onToggle: leftSide }
               : { open: canDock ? !columnHidden : drawerOpen, drawer: !canDock, onToggle: leftSide }} />}
@@ -1670,6 +1731,19 @@ export function Shell(p: ShellProps) {
         {editingProject && on.categoryOp && <ProjectDialog cwd={editingProject} meta={p.categories?.projectMeta?.[editingProject]} home={p.home}
           onPickFolder={on.pickFolder} onSave={op => on.categoryOp?.(op)} onRemove={() => on.categoryOp?.({ op: 'removeProject', cwd: editingProject })}
           onClose={() => setEditingProject(undefined)} />}
+        {switcher && (
+          <SessionSwitcher
+            sessions={switcherSessions}
+            activeId={p.pendingSessionId ?? p.activeSessionId}
+            recent={recent}
+            agents={p.agents}
+            categories={p.categories}
+            chats={desktop ? p.chats : undefined}
+            onSelect={openSession}
+            onSearchContent={position !== 'hidden' && on.searchSessions ? query => keys.current.focusSearch(query) : undefined}
+            onClose={closeSwitcher}
+          />
+        )}
         {quickOpen && (
           <QuickOpen
             searchFiles={on.searchFiles}

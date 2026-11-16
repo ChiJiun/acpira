@@ -64,7 +64,7 @@ const isLive = (s: SessionSummary) => s.state === 'working' || s.state === 'back
 // A background ring waiting on Claude's scheduled wakeup names the time it resumes; the mark itself stays the same, since
 // either way the session is alive and asks nothing of the user
 interface Mark { state: NonNullable<SessionSummary['state']>; unread?: boolean; wakeAt?: number }
-function StateMark({ state, unread, wakeAt }: Mark) {
+export function StateMark({ state, unread, wakeAt }: Mark) {
   const label = state === 'background' && wakeAt
     ? t(unread ? 'session.state.wakeupUnread' : 'session.state.wakeup', { time: dateFormat(getLocale(), { hour: 'numeric', minute: '2-digit' }).format(wakeAt) })
     : t(state === 'background' && unread ? 'session.state.backgroundUnread' : `session.state.${state}`);
@@ -276,6 +276,10 @@ export interface SessionListProps {
   chats?: string;
   // Desktop: the chats section's pen, a new chat on the start page
   onNewChat?: () => void;
+  // A query to put in the search field (the session switcher's "search messages" row); a new seq puts it again.
+  // `onSeedTaken` reports it put, so the owner drops it and a remounted list does not put a stale query again
+  searchSeed?: { query: string; seq: number };
+  onSeedTaken?: (seq: number) => void;
 }
 
 // The drag payload's type: WebKit starts no drag without data. Telling a row's drag goes by `held`, not by this type
@@ -349,7 +353,7 @@ function perKey<T>(compute: (key: string) => T): (key: string) => T {
 // (FlipRows). The desktop app (DesktopContext) lists its registered projects in their own order without categories, each
 // open project its latest sessions with the rest behind one row.
 // Deletion applies immediately, undo lives on the Toast at the shell's bottom
-export const SessionList = memo(function SessionList({ sessions, agents, activeId, workspace, scope = 'all', autoFocus, fill, activeAgent, nativeSessions, onListNative, onImportNative, onSelect, onRename, onDelete, onPin, onArchive, onUnread, onMove, onExport, onCopy, onSearch, categories: categoryState, onFile, onCategoryOp, onNewInCategory, nav, onNew, onNewIn, onAddProject, onAddRemote, onEditProject, onRevealPath, onCopyPath, fresh, onMarkAllRead, chats, onNewChat }: SessionListProps) {
+export const SessionList = memo(function SessionList({ sessions, agents, activeId, workspace, scope = 'all', autoFocus, fill, activeAgent, nativeSessions, onListNative, onImportNative, onSelect, onRename, onDelete, onPin, onArchive, onUnread, onMove, onExport, onCopy, onSearch, categories: categoryState, onFile, onCategoryOp, onNewInCategory, nav, onNew, onNewIn, onAddProject, onAddRemote, onEditProject, onRevealPath, onCopyPath, fresh, onMarkAllRead, chats, onNewChat, searchSeed, onSeedTaken }: SessionListProps) {
   const locale = useLocale();
   const desktop = useDesktop();
   const projectMarks = useAppearance().projectMarks === 'on';
@@ -357,6 +361,11 @@ export const SessionList = memo(function SessionList({ sessions, agents, activeI
   const connections = useConnections();
   const remoteHosts = onAddRemote ? connections : undefined;
   const [query, setQuery] = useState('');
+  useEffect(() => {
+    if (!searchSeed) return;
+    setQuery(searchSeed.query);
+    onSeedTaken?.(searchSeed.seq);
+  }, [searchSeed, onSeedTaken]);
   // The view menu's choices (grouping, ordering, what rows show, filters), kept per window across reloads
   const [view, setViewState] = useState<ListView>(() => readView(webviewState(VIEW_KEY)));
   const setView = (next: ListView) => { setViewState(next); setWebviewState(VIEW_KEY, next); };
@@ -1005,8 +1014,8 @@ export const SessionList = memo(function SessionList({ sessions, agents, activeI
                 </DropdownMenu.Popup></DropdownMenu.Positioner></DropdownMenu.Portal>
               </DropdownMenu.Root>
             )}
-          {/* Desktop: the row reads like the one above it until focused, its shortcut at the end */}
-          <NavSearch part="session-search" value={query} onChange={setQuery} autoFocus={autoFocus} quiet={desktop} hint={desktop && shortcutLabel('K')}
+          {/* Desktop: the row reads like the one above it until focused. No shortcut: ⌘K opens the session switcher, whose last row searches here */}
+          <NavSearch part="session-search" value={query} onChange={setQuery} autoFocus={autoFocus} quiet={desktop}
             placeholder={desktop ? t('session.searchShort') : onSearch ? t('session.searchContent') : t('session.search')}
             label={onSearch ? t('session.searchContent') : t('session.search')} />
           {!desktop && importer}
