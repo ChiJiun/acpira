@@ -132,23 +132,33 @@ export class GitHub {
     } catch (e) {
       throw new GhError(`gh could not run: ${(e as Error).message}`, args);
     }
-    const text = `${r.stderr}\n${r.stdout}`;
-    if (/no checks reported/i.test(text)) return { state: 'none' };
-    let list: { name?: string; state?: string; bucket?: string; link?: string; workflow?: string; description?: string }[];
-    try {
-      list = JSON.parse(r.stdout || 'null');
-    } catch {
-      throw new GhError(`gh pr checks failed (exit ${r.code}): ${text.trim().slice(-800)}`, args, r);
+    const failure = () => new GhError(`gh pr checks failed (exit ${r.code}): ${`${r.stderr}\n${r.stdout}`.trim().slice(-800)}`, args, r);
+    // stdout is JSON whose names and descriptions come from the PR branch's own workflows: once it parses, only the
+    // `bucket` fields decide. gh's own "no checks" message is read from stderr alone, and only when stdout holds no JSON
+    let list: unknown = null;
+    const out = r.stdout.trim();
+    if (out) {
+      try {
+        list = JSON.parse(out);
+      } catch {
+        throw failure();
+      }
+    } else {
+      if (r.code !== 0 && /^\s*no checks reported\b/i.test(r.stderr)) return { state: 'none' };
+      if (r.code === 0) list = [];
+      else throw failure();
     }
-    if (!Array.isArray(list)) throw new GhError(`gh pr checks failed (exit ${r.code}): ${text.trim().slice(-800)}`, args, r);
-    if (list.length === 0) return { state: 'none' };
-    const bucket = (c: (typeof list)[number]) => (c.bucket ?? '').toLowerCase();
-    const failed = list.filter(c => bucket(c) === 'fail' || bucket(c) === 'cancel');
+    if (!Array.isArray(list)) throw failure();
+    const checks = list as { name?: string; state?: string; bucket?: string; link?: string; workflow?: string; description?: string }[];
+    if (checks.length === 0) return { state: 'none' };
+    const bucket = (c: (typeof checks)[number]) => String(c?.bucket ?? '').toLowerCase();
+    const failed = checks.filter(c => bucket(c) === 'fail' || bucket(c) === 'cancel');
     if (failed.length) {
-      return { state: 'fail', failed: failed.map(c => ({ name: c.name ?? '', workflow: c.workflow ?? '', link: c.link ?? '', description: c.description ?? '' })) };
+      return { state: 'fail', failed: failed.map(c => ({ name: String(c.name ?? ''), workflow: String(c.workflow ?? ''), link: String(c.link ?? ''), description: String(c.description ?? '') })) };
     }
-    const pending = list.filter(c => bucket(c) === 'pending' || (!bucket(c) && /pending|queued|in_progress|waiting/i.test(c.state ?? '')));
-    if (pending.length) return { state: 'pending', pending: pending.map(c => c.name ?? '') };
+    // Anything but a known passing bucket waits: an unknown one is never taken for a pass
+    const pending = checks.filter(c => bucket(c) !== 'pass' && bucket(c) !== 'skipping');
+    if (pending.length) return { state: 'pending', pending: pending.map(c => String(c.name ?? '')) };
     return { state: 'pass' };
   }
 

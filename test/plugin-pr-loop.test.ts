@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FAKE, NODE, Shell } from './sidecarShell';
 import { FORBIDDEN_FLAGS, GitHub, guardArgs, parsePrUrl, type RunResult } from '../plugins/pr-loop/src/github';
-import { lastReply, MAX_ROUNDS, NO_CI_GRACE_MS, PrLoop, type AskOption, type Host, type Loop, type SessionInfo, type SessionView, type Store } from '../plugins/pr-loop/src/machine';
+import { CI_WAIT_MS, FIX_WAIT_MS, lastReply, MAX_ROUNDS, NO_CI_GRACE_MS, PrLoop, REVIEW_WAIT_MS, type AskOption, type Host, type Loop, type SessionInfo, type SessionView, type Store } from '../plugins/pr-loop/src/machine';
 import { brief, issueKey, parseVerdict, section, verdictBegin, verdictEnd } from '../plugins/pr-loop/src/review';
 
 // The pr-loop plugin's state machine against a fake `gh` and a fake engine: no Acpira, no GitHub
@@ -20,8 +20,9 @@ interface FakePr {
   isDraft: boolean;
   mergeable: string;
   mergeCommit: string | null;
+  base: string;
   // What `gh pr checks` answers, in turn (the last one repeats)
-  checks: ('none' | 'pending' | 'pass' | 'fail')[];
+  checks: ('none' | 'pending' | 'pass' | 'fail' | RunResult)[];
 }
 
 class FakeGh {
@@ -41,6 +42,7 @@ class FakeGh {
       isDraft: false,
       mergeable: 'MERGEABLE',
       mergeCommit: null,
+      base: 'main',
       checks: ['pass'],
     });
   }
@@ -67,11 +69,12 @@ class FakeGh {
     if (args[1] === 'view') {
       return ok({
         number, url: `https://github.com/${repo}/pull/${number}`, state: pr.state, isDraft: pr.isDraft, title: 'Add the thing', body: pr.body,
-        headRefName: 'feature/thing', headRefOid: pr.head, baseRefName: 'main', mergeable: pr.mergeable, mergeCommit: pr.mergeCommit ? { oid: pr.mergeCommit } : null,
+        headRefName: 'feature/thing', headRefOid: pr.head, baseRefName: pr.base, mergeable: pr.mergeable, mergeCommit: pr.mergeCommit ? { oid: pr.mergeCommit } : null,
       });
     }
     if (args[1] === 'checks') {
       const now = pr.checks.length > 1 ? pr.checks.shift()! : pr.checks[0]!;
+      if (typeof now === 'object') return now;
       if (now === 'none') return { code: 1, stdout: '', stderr: "no checks reported on the 'feature/thing' branch" };
       if (now === 'pending') return { code: 8, stdout: JSON.stringify([{ name: 'test', state: 'IN_PROGRESS', bucket: 'pending', workflow: 'CI', link: '' }]), stderr: '' };
       if (now === 'fail') return { code: 1, stdout: JSON.stringify([{ name: 'test', state: 'FAILURE', bucket: 'fail', workflow: 'CI', link: 'https://ci/1', description: 'tests failed' }]), stderr: '' };
@@ -839,6 +842,258 @@ describe('pr-loop state machine', { timeout: 60_000 }, () => {
     };
     expect(lastReply(view, n)).toEqual({ asked: true, replied: true, text: 'the verdict', error: '' });
     expect(lastReply(view, 'other').asked).toBe(false);
+  });
+
+  describe('CI state is read from the bucket fields, never from check names', () => {
+    const failing = (name: string, description: string): RunResult => ({
+      code: 1,
+      stdout: JSON.stringify([{ name, state: 'FAILURE', bucket: 'fail', workflow: 'CI', link: 'https://ci/2', description }]),
+      stderr: '',
+    });
+
+    it('a failing check named or described like "no checks reported" is a failure', async () => {
+      for (const r of [failing('no checks reported', ''), failing('unit', 'No checks reported: 3 tests failed'), { ...failing('unit', 'x'), stderr: 'no checks reported' }]) {
+        const gh = new GitHub(async () => r);
+        const ci = await gh.checks(REPO, 12);
+        expect(ci.state).toBe('fail');
+      }
+      // gh's own message, on stderr with nothing on stdout, is "no CI"
+      expect((await new GitHub(async () => ({ code: 1, stdout: '', stderr: "no checks reported on the 'x' branch" })).checks(REPO, 12)).state).toBe('none');
+      // Anything else unreadable is an error, not "no CI"
+      await expect(new GitHub(async () => ({ code: 1, stdout: '', stderr: 'HTTP 502 (no checks reported?)' })).checks(REPO, 12)).rejects.toThrow();
+      await expect(new GitHub(async () => ({ code: 1, stdout: 'no checks reported', stderr: '' })).checks(REPO, 12)).rejects.toThrow();
+      // A bucket it does not know waits instead of passing
+      expect((await new GitHub(async () => ({ code: 0, stdout: JSON.stringify([{ name: 'a', bucket: 'weird' }]), stderr: '' })).checks(REPO, 12)).state).toBe('pending');
+    });
+
+    it('auto: such a failing check is sent back, not merged after the no-CI grace', async () => {
+      const { gh, host, m, flush, loop, clock } = setup({ merge: 'auto' });
+      gh.pr().checks = [failing('no checks reported', 'No checks reported')];
+      host.onFix = () => {};
+      host.replies.push(pass());
+      await m.command('impl', '12');
+      await flush();
+      clock.advance(3 * 60_000);
+      await m.tick();
+      await flush();
+      expect(gh.merges()).toEqual([]);
+      expect(host.sent.filter(s => s.session === 'impl')[0]!.text).toContain('CI 失敗');
+      expect((await loop()).phase).toBe('waitingFix');
+    });
+  });
+
+  it('stops when the PR is moved to another target branch after the review, and never merges into it on its own', async () => {
+    const { gh, host, m, flush, loop } = setup({ merge: 'auto' });
+    gh.pr().checks = ['pending', 'pass'];
+    host.replies.push(pass(), pass());
+    await m.command('impl', '12');
+    await flush();
+    expect((await loop()).phase).toBe('waitingCi');
+    gh.pr().base = 'release';
+    await m.tick();
+    await flush();
+    const l = await loop();
+    expect(l.stop?.reason).toBe('base-changed');
+    expect(l.stop?.resume).toBe('review');
+    expect(host.said()).toContain('`release`');
+    expect(gh.merges()).toEqual([]);
+    expect(host.made).toHaveLength(1);
+    // Resuming is the user's word that the new branch is right: a fresh review against it, then the merge
+    await m.command('impl', 'resume');
+    await flush();
+    expect(host.made).toHaveLength(2);
+    expect(host.sent.find(s => s.session === 'rev-2')!.text).toContain('release');
+    expect((await loop()).rounds.map(r => r.base)).toEqual(['main', 'release']);
+    expect(gh.merges()).toHaveLength(1);
+  });
+
+  it('a target branch change while waiting for the fix stops too', async () => {
+    const { gh, host, m, flush, loop } = setup();
+    host.replies.push(reject());
+    await m.command('impl', '12');
+    await flush();
+    gh.pr().base = 'release';
+    await m.tick();
+    await flush();
+    expect((await loop()).stop?.reason).toBe('base-changed');
+    expect(host.made).toHaveLength(1);
+  });
+
+  it('a PR closed while resuming keeps the way on it was resumed with, and a round is never read twice', async () => {
+    const { gh, host, m, flush, loop } = setup();
+    host.replies.push('不是固定格式', pass());
+    await m.command('impl', '12');
+    await flush();
+    expect((await loop()).stop?.reason).toBe('unparseable');
+    gh.pr().state = 'CLOSED';
+    await m.command('impl', 'resume');
+    await flush();
+    const closed = await loop();
+    expect(closed.stop?.reason).toBe('pr-closed');
+    expect(closed.stop?.resume).toBe('review');
+    gh.pr().state = 'OPEN';
+    await m.command('impl', 'resume');
+    await flush();
+    const l = await loop();
+    expect(host.made).toHaveLength(2);
+    expect(l.rounds.map(r => [r.round, r.result])).toEqual([[1, 'unparseable'], [2, 'mergeable']]);
+    expect(l.phase).toBe('merged');
+  });
+
+  it('a merge whose follow-up read fails is confirmed on resume and reported as merged', async () => {
+    // Through the merge card, whose failure path resumes with a CI check: the stop in `merging` must win over it
+    const { gh, host, m, flush, loop } = setup();
+    host.replies.push(pass());
+    gh.failNext = args => args[1] === 'view' && gh.merges().length > 0;
+    await m.command('impl', '12');
+    await flush();
+    const stopped = await loop();
+    expect(stopped.stop?.reason).toBe('gh');
+    expect(stopped.stop?.step).toBe('merging');
+    await m.command('impl', 'resume');
+    await flush();
+    const l = await loop();
+    expect(l.phase).toBe('merged');
+    expect(l.merge?.commit).toBe('mmmmmmmm1');
+    expect(gh.merges()).toHaveLength(1);
+    expect(host.said()).toContain('已合併 me/app#12');
+  });
+
+  describe('waits that run out stop and say so', () => {
+    it('no push after the fix list', async () => {
+      const { host, m, flush, loop, clock } = setup();
+      host.replies.push(reject());
+      host.onFix = () => {};
+      await m.command('impl', '12');
+      await flush();
+      clock.advance(FIX_WAIT_MS + 1);
+      await m.tick();
+      await flush();
+      const l = await loop();
+      expect(l.stop?.reason).toBe('stalled');
+      expect(host.said()).toContain('沒有 push');
+      // Resuming waits again from now
+      await m.command('impl', 'resume');
+      await flush();
+      expect((await loop()).phase).toBe('waitingFix');
+    });
+
+    it('CI that never finishes', async () => {
+      const { gh, host, m, flush, loop, clock } = setup();
+      gh.pr().checks = ['pending'];
+      host.replies.push(pass());
+      await m.command('impl', '12');
+      await flush();
+      clock.advance(CI_WAIT_MS + 1);
+      await m.tick();
+      await flush();
+      expect((await loop()).stop?.reason).toBe('stalled');
+      expect(gh.merges()).toEqual([]);
+    });
+
+    it('a reviewer that keeps working (or waits on a permission card)', async () => {
+      const { host, m, flush, loop, clock } = setup();
+      host.send = async (session, text) => {
+        host.sent.push({ session, text });
+        host.views.set(session, { running: true, turns: [{ role: 'user', text }] });
+      };
+      await m.command('impl', '12');
+      await flush();
+      await m.tick();
+      await flush();
+      expect((await loop()).phase).toBe('reviewing');
+      clock.advance(REVIEW_WAIT_MS + 1);
+      await m.tick();
+      await flush();
+      expect((await loop()).stop?.reason).toBe('stalled');
+      expect(host.said()).toContain('權限卡片');
+    });
+  });
+
+  it('a fix list cut short by an engine restart stops instead of waiting for a push that may never come', async () => {
+    const { host, m, make, flush, loop, clock } = setup();
+    host.replies.push(reject());
+    const send = host.send.bind(host);
+    host.send = (session, text) => (session === 'impl' ? (host.sent.push({ session, text }), new Promise<void>(() => {})) : send(session, text));
+    await m.command('impl', '12');
+    await flush();
+    const before = await loop();
+    expect(before.phase).toBe('waitingFix');
+    expect(before.fixSending).not.toBeNull();
+    clock.advance(10 * 60_000);
+    const again = make('engine-2');
+    await again.tick();
+    await flush(again);
+    const l = await loop();
+    expect(l.stop?.reason).toBe('interrupted');
+    expect(l.stop?.resume).toBe('fix');
+  });
+
+  it('a PR argument matches repo and number exactly', async () => {
+    const { host, m, flush, loop } = setup();
+    host.replies.push(reject());
+    host.onFix = () => {};
+    await m.command('impl', '12');
+    await flush();
+    await m.command('impl', 'stop https://github.com/me/ap/pull/12');
+    await flush();
+    expect((await loop()).phase).toBe('waitingFix');
+    await m.command('impl', 'stop https://ghe.example.com/me/app/pull/12');
+    await flush();
+    expect((await loop()).phase).toBe('waitingFix');
+    await m.command('impl', `stop ${PR_URL}`);
+    await flush();
+    expect((await loop()).phase).toBe('cancelled');
+  });
+
+  it('an older stop card does nothing once the loop stopped again', async () => {
+    const { gh, host, m, flush, loop } = setup();
+    host.replies.push('不是固定格式');
+    await m.command('impl', '12');
+    await flush();
+    gh.failNext = args => args[1] === 'view';
+    await m.command('impl', 'resume');
+    await flush();
+    expect((await loop()).stop?.reason).toBe('gh');
+    const stopCards = host.cards.filter(c => c.options.some(o => o.id === 'resume'));
+    expect(stopCards).toHaveLength(2);
+    stopCards[0]!.resolve('resume');
+    await flush();
+    expect(host.made).toHaveLength(1);
+    expect(host.said()).toContain('已經過去');
+    stopCards[1]!.resolve('resume');
+    await flush();
+    expect(host.made).toHaveLength(2);
+  });
+
+  it("an old merge card's answer does not open a second card for a restarted loop", async () => {
+    const { host, m, flush } = setup();
+    host.mergeAnswer = null;
+    host.replies.push(pass(), pass());
+    await m.command('impl', '12');
+    await flush();
+    await m.command('impl', 'stop');
+    await flush();
+    await m.command('impl', '12');
+    await flush();
+    const mergeCards = () => host.cards.filter(c => c.options.some(o => o.id === 'merge'));
+    expect(mergeCards()).toHaveLength(2);
+    mergeCards()[0]!.resolve('later');
+    await flush();
+    await m.tick();
+    await flush();
+    expect(mergeCards()).toHaveLength(2);
+  });
+
+  it('the start card shows the requirement it will send, and warns when it came from the PR body', async () => {
+    const { gh, host, m, flush } = setup();
+    gh.pr().body += '\n\n## 需求原文\nPR 描述裡的需求';
+    host.replies.push(pass());
+    await m.command('impl', '12');
+    await flush();
+    const start = host.cards.find(c => c.message.includes('開始 me/app#12'))!.message;
+    expect(start).toContain('> PR 描述裡的需求');
+    expect(start).toContain('實作者自己寫在 PR 描述裡');
   });
 
   it('never passes --auto, --squash or --rebase to gh, in any scenario above or by construction', async () => {

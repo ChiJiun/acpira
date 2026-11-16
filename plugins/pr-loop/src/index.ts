@@ -72,10 +72,14 @@ function runner(ctx: Context) {
 }
 
 let machine: PrLoop | null = null;
+let log: (text: string) => void = () => {};
 
 export default definePlugin({
   activate(ctx) {
     machine = new PrLoop({ host: host(ctx), store: store(ctx), gh: new GitHub(runner(ctx)), owner: `${process.pid}-${randomUUID()}` });
+    log = text => ctx.log(text);
+    // A rejection nobody handled must not end the plugin's process (Node's default): it is logged instead
+    process.on('unhandledRejection', e => ctx.log(`unhandled: ${(e as Error)?.stack ?? String(e)}`));
     let timer: ReturnType<typeof setTimeout> | null = null;
     let closed = false;
     const loop = async () => {
@@ -98,7 +102,7 @@ export default definePlugin({
   events: {
     'turn.ended': e => {
       const session = e.data?.session;
-      if (typeof session === 'string') void machine?.onTurnEnded(session);
+      if (typeof session === 'string') machine?.onTurnEnded(session).catch(err => log(`turn.ended: ${(err as Error).message}`));
     },
   },
   commands: {
@@ -106,7 +110,7 @@ export default definePlugin({
     'pr-loop': (args, ctx) => {
       const session = ctx.session;
       if (!machine || !session) return null;
-      void machine.command(session, args);
+      machine.command(session, args).catch(err => ctx.log(`/pr-loop: ${(err as Error).message}`));
       return null;
     },
   },

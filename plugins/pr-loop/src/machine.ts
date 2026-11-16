@@ -9,7 +9,8 @@
 // The merge invariant: `gh pr merge` runs only while the newest round's verdict is `mergeable` for exactly the PR's
 // current head (`passed`). Nothing else (a phase, a resume, a stored sha) stands in for it
 
-import { GhError, type GitHub, type PullRequest } from './github';
+import { randomBytes } from 'node:crypto';
+import { GhError, parsePrUrl, type GitHub, type PullRequest } from './github';
 import {
   brief,
   ciFailure,
@@ -90,6 +91,11 @@ export const NO_CI_GRACE_MS = 2 * 60_000;
 // taken over by another engine
 const STALE_POLLS = 3;
 const STALE_MIN_MS = 5 * 60_000;
+// How long a step may wait on someone else before the loop stops and says so: a reviewer still working (or held by a
+// permission card), the implementing session not pushing the fix, CI not finishing
+export const REVIEW_WAIT_MS = 60 * 60_000;
+export const FIX_WAIT_MS = 4 * 60 * 60_000;
+export const CI_WAIT_MS = 2 * 60 * 60_000;
 const LOG_MAX = 40;
 const KEEP_FINISHED = 20;
 const ASK_WAIT_SECS = 25 * 60;
@@ -114,6 +120,8 @@ export type StopReason =
   | 'draft'
   | 'merge-conflict'
   | 'not-allowed'
+  | 'base-changed'
+  | 'stalled'
   | 'error';
 
 // What `/pr-loop resume` does after a stop: a new review round, the stored fix list sent, the CI step again, or the
@@ -123,6 +131,8 @@ export type Resume = 'review' | 'fix' | 'ci' | 'retry';
 export interface Round {
   round: number;
   sha: string;
+  // The branch the PR targeted when this round was reviewed: the diff the reviewer saw
+  base: string;
   reviewer: string;
   at: number;
   result: 'mergeable' | 'not_mergeable' | 'unparseable' | 'conflict';
@@ -138,6 +148,8 @@ export interface Stop {
   detail: string;
   resume: Resume | null;
   at: number;
+  // Names this stop; a stop card acts only on the stop it was shown for
+  id: string;
 }
 
 export interface Loop {
@@ -158,12 +170,19 @@ export interface Loop {
   round: number;
   roundLimit: number;
   reviewedSha: string;
+  // The target branch the current round reviews against
+  reviewedBase: string;
   baseSha: string;
   reviewer: { session: string; agent: string; sentAt: number; nonce: string } | null;
   rounds: Round[];
   pendingFix: string | null;
   // The fix list (`pendingFix`) is decided but not yet handed to the implementing session
   fixPending: boolean;
+  // The fix list's prompt was started at this time and has not been seen to go out yet; found after an engine restart it
+  // means the fix list may or may not have reached the session
+  fixSending: number | null;
+  // When the current wait on someone else began (a reviewer, a fix, CI); a resume starts it again
+  since: number;
   lastCiFail: string[] | null;
   // When "no checks" was first seen for the current head
   noCiSince: { sha: string; at: number } | null;
@@ -213,6 +232,8 @@ const REASON_TEXT: Record<StopReason, string> = {
   draft: 'PR 是 draft，不能合併',
   'merge-conflict': 'PR 與目標分支有衝突',
   'not-allowed': 'PR 所在的 repo 不在允許清單',
+  'base-changed': 'PR 的目標分支和 review 時不同',
+  stalled: '等太久沒有進展',
   error: '外掛內部錯誤',
 };
 
@@ -225,6 +246,12 @@ const RESUME_TEXT: Record<Resume, string> = {
 
 export const keyOf = (repo: string, number: number) => `${repo.toLowerCase()}#${number}`;
 const short = (sha: string) => sha.slice(0, 8);
+const REQUIREMENT_SHOWN = 1200;
+const quote = (text: string) =>
+  (text.length > REQUIREMENT_SHOWN ? `${text.slice(0, REQUIREMENT_SHOWN)}…（共 ${text.length} 字，後面省略）` : text)
+    .split('\n')
+    .map(l => `> ${l}`)
+    .join('\n');
 const sameRepo = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
 // The reply to the prompt carrying `nonce`: the agent turns after that user turn, up to the next user turn (a later
@@ -253,13 +280,14 @@ export function lastReply(view: SessionView, nonce: string): { asked: boolean; r
   return { asked: true, replied: after.length > 0, text, error };
 }
 
-// The newest round passed review for exactly `sha`: the only ground for a merge or a merge card
-export function passed(loop: Loop, sha: string): boolean {
+// The newest round passed review for exactly `sha` against exactly the target branch `base`: the only ground for a
+// merge or a merge card
+export function passed(loop: Loop, sha: string, base: string): boolean {
   const last = loop.rounds[loop.rounds.length - 1];
-  return !!last && last.round === loop.round && last.result === 'mergeable' && last.sha === sha && !!sha;
+  return !!last && last.round === loop.round && last.result === 'mergeable' && !!sha && last.sha === sha && !!base && last.base === base;
 }
 
-const randomNonce = () => Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+const randomNonce = () => randomBytes(8).toString('hex');
 
 export interface Deps {
   host: Host;
@@ -279,8 +307,12 @@ export class PrLoop {
   private readonly nonce: () => string;
   readonly owner: string;
   private chain: Promise<unknown> = Promise.resolve();
-  // Cards open right now, by loop key: a tick never shows a second one
-  private readonly asking = new Set<string>();
+  // Merge cards open right now, by loop key (the value names the card): a tick never shows a second one, and an old
+  // card's answer never clears a newer one
+  private readonly asking = new Map<string, number>();
+  private cardSeq = 0;
+  // Fix-list prompts this process started and has not seen go out
+  private readonly inflight = new Set<string>();
   private staleMs = STALE_MIN_MS;
 
   constructor(deps: Deps) {
@@ -493,14 +525,9 @@ export class PrLoop {
   }
 
   private async findLoop(session: string, ref: string | null, want: (l: Loop) => boolean): Promise<Loop | null> {
-    const all = (await this.loops()).filter(want);
-    if (ref) {
-      const byUrl = /\/pull\/(\d+)/.exec(ref);
-      const n = Number(ref.replace(/^#/, ''));
-      return all.find(l => l.url === ref || (byUrl && l.url.startsWith(ref.split('/pull/')[0]!) && l.number === Number(byUrl[1])) || (Number.isInteger(n) && l.number === n)) ?? null;
-    }
-    const mine = all.filter(l => l.implSession === session).sort((a, b) => b.updatedAt - a.updatedAt);
-    return mine[0] ?? null;
+    const all = (await this.loops()).filter(want).sort((a, b) => b.updatedAt - a.updatedAt);
+    if (!ref) return all.find(l => l.implSession === session) ?? null;
+    return pickLoop(all, session, ref);
   }
 
   private async cancel(session: string, ref: string | null): Promise<void> {
@@ -528,6 +555,8 @@ export class PrLoop {
     // Back to the step it stopped at, so a failure while resuming records that step and the same way on
     loop.stop = null;
     loop.phase = stop.step;
+    // A wait that ran out starts over
+    loop.since = this.now();
     // Going on after a stop is the user's call, so the round it needs is granted
     if (action === 'review' || action === 'fix') loop.roundLimit = Math.max(loop.roundLimit, loop.round + 1);
     if (stop.reason === 'conflict') {
@@ -536,9 +565,12 @@ export class PrLoop {
       if (last?.result === 'conflict' && last.verdict) last.result = last.verdict;
     }
     await this.save(loop, true);
+    // Stopped around the merge: GitHub says whether it happened before anything else is done
+    if (stop.step === 'merging') return this.guarded(loop, () => this.recoverMerge(loop), action);
     switch (action) {
       case 'review':
-        return this.guarded(loop, () => this.launchReview(loop), action);
+        // After a target branch change, resuming is the user's word that the new branch is the agreed one
+        return this.guarded(loop, () => this.launchReview(loop, undefined, stop.reason === 'base-changed'), action);
       case 'fix':
         loop.phase = 'waitingFix';
         loop.fixPending = true;
@@ -589,7 +621,8 @@ export class PrLoop {
       return this.say(session, 'pr-loop：找不到需求原文。請在指令後面附上（`/pr-loop <PR> <需求原文>`），或在 PR 描述加一段「## 需求原文」。', 'warning');
     }
     const notes = section(pr.body, NOTES_TITLES);
-    const now = this.now();
+    // `createdAt` tells a loop from an earlier one for the same PR: never the same value
+    const now = Math.max(this.now(), (existing?.createdAt ?? 0) + 1);
     const loop: Loop = {
       key,
       repo: pr.repo,
@@ -608,11 +641,14 @@ export class PrLoop {
       round: 0,
       roundLimit: MAX_ROUNDS,
       reviewedSha: '',
+      reviewedBase: pr.baseRefName,
       baseSha: pr.headRefOid,
       reviewer: null,
       rounds: [],
       pendingFix: null,
       fixPending: false,
+      fixSending: null,
+      since: now,
       lastCiFail: null,
       noCiSince: null,
       stop: null,
@@ -628,7 +664,8 @@ export class PrLoop {
       session,
       [
         `pr-loop：開始 ${pr.repo}#${pr.number}「${pr.title}」的自動循環。`,
-        `- 需求原文來源：${SOURCE_TEXT[source]}`,
+        `- 需求原文來源：${SOURCE_TEXT[source]}${source === 'pr-body' ? '（這段是實作者自己寫在 PR 描述裡的，請確認它就是你的需求；不對就 `/pr-loop stop` 後附上需求原文重新開始）' : ''}`,
+        `- 送給 reviewer 的需求原文：\n${quote(requirement)}`,
         `- 給 reviewer 的重點建議：${notes ? '已從 PR 描述取得' : 'PR 描述中沒有這一段'}`,
         `- reviewer agent：${c.reviewerAgent || `${info.agent}（與實作 session 相同）`}`,
         `- 合併方式：${c.merge === 'auto' ? '條件都滿足時自動合併（merge commit）' : '合併前出確認卡片（merge commit）'}`,
@@ -663,7 +700,7 @@ export class PrLoop {
   // The loop stops for the user: where it is, what was done, and what resuming would do
   private async halt(loop: Loop, reason: StopReason, detail: string, resume: Resume | null): Promise<void> {
     const step: Phase = loop.phase === 'stopped' ? (loop.stop?.step ?? 'launching') : loop.phase;
-    loop.stop = { reason, step, detail, resume, at: this.now() };
+    loop.stop = { reason, step, detail, resume, at: this.now(), id: randomBytes(6).toString('hex') };
     loop.phase = 'stopped';
     this.note(loop, `停下：${REASON_TEXT[reason]}`);
     try {
@@ -689,24 +726,38 @@ export class PrLoop {
       `- 查看狀態（\`/pr-loop status\`）`,
     ].join('\n');
     await this.host.toast(`pr-loop：${loop.repo}#${loop.number} 停下 —— ${REASON_TEXT[reason]}`, 'warning').catch(() => {});
-    if (this.asking.has(loop.key)) return;
+    // Every stop gets its own card: a card answers only the stop it describes, so an older one left open does nothing
     const options: AskOption[] = [...(resume ? [{ id: 'resume', label: '接續' }] : []), { id: 'stop', label: '停止循環' }, { id: 'later', label: '稍後決定' }];
-    this.asking.add(loop.key);
     const createdAt = loop.createdAt;
-    const stopAt = loop.stop.at;
-    void this.host
-      .ask(loop.implSession, message, options, ASK_WAIT_SECS)
-      .catch(() => null)
-      .then(answer =>
-        this.exclusive(async () => {
-          this.asking.delete(loop.key);
-          const now = await this.loop(loop.key);
-          // Only for the stop this card was about
-          if (!now || now.createdAt !== createdAt || now.phase !== 'stopped' || now.stop?.at !== stopAt) return;
-          if (answer === 'resume') await this.resume(now);
-          else if (answer === 'stop') await this.cancel(now.implSession, now.url);
-        }),
-      );
+    const stopId = loop.stop.id;
+    this.background(
+      this.host
+        .ask(loop.implSession, message, options, ASK_WAIT_SECS)
+        .catch(() => null)
+        .then(answer =>
+          this.exclusive(async () => {
+            const now = await this.loop(loop.key);
+            if (!now || now.createdAt !== createdAt || now.phase !== 'stopped' || now.stop?.id !== stopId) {
+              if (answer === 'resume' || answer === 'stop') await this.say(now?.implSession ?? null, 'pr-loop：這張卡片說的那次停下已經過去了，請看最新的卡片或 `/pr-loop status`。');
+              return;
+            }
+            if (answer === 'resume') await this.resume(now);
+            else if (answer === 'stop') await this.cancel(now.implSession, now.url);
+          }),
+        ),
+      'stop card',
+    );
+  }
+
+  // A promise nobody awaits: a failure is logged, never left to end the plugin's process
+  private background(p: Promise<unknown>, what: string): void {
+    p.catch(e => {
+      try {
+        this.host.log(`${what}: ${(e as Error)?.stack ?? String(e)}`);
+      } catch {
+        /* nothing left to report to */
+      }
+    });
   }
 
   // Every loop this engine runs, one step each
@@ -773,20 +824,36 @@ export class PrLoop {
     };
   }
 
-  // The PR as it is now, or a stop when it is closed or merged by someone else
-  private async openPr(loop: Loop): Promise<PullRequest | null> {
+  // The PR as it is now, or a stop when it is closed, merged by someone else, or now targets another branch than the
+  // one reviewed. `resume` is what resuming after such a stop does: the caller's own way on, so a reopened PR picks up
+  // where it was. `acceptBase`: the user chose to review against the new target branch
+  private async openPr(loop: Loop, resume: Resume, acceptBase = false): Promise<PullRequest | null> {
     const pr = await this.gh.pr(loop.number, loop.repo);
     if (pr.state === 'MERGED') {
       await this.halt(loop, 'pr-merged-elsewhere', `PR 已經在 pr-loop 之外被合併${pr.mergeCommit ? `（merge commit ${pr.mergeCommit}）` : ''}。`, null);
       return null;
     }
     if (pr.state === 'CLOSED') {
-      await this.halt(loop, 'pr-closed', 'PR 已被關閉。重新打開後可以接續。', 'retry');
+      await this.halt(loop, 'pr-closed', 'PR 已被關閉。重新打開後可以接續。', resume);
       return null;
     }
+    if (!acceptBase && !(await this.sameBase(loop, pr))) return null;
     loop.headRef = pr.headRefName;
     loop.baseRef = pr.baseRefName;
     return pr;
+  }
+
+  // The PR still targets the branch this round reviews against; otherwise a stop for the user: a merge target other
+  // than the agreed one is theirs to decide, and nothing reviewed so far covers the diff against the new one
+  private async sameBase(loop: Loop, pr: PullRequest): Promise<boolean> {
+    if (!loop.reviewedBase || pr.baseRefName === loop.reviewedBase) return true;
+    await this.halt(
+      loop,
+      'base-changed',
+      `PR 的目標分支從 \`${loop.reviewedBase}\` 改成了 \`${pr.baseRefName}\`。到目前為止的 review 都是對 \`${loop.reviewedBase}\` 的差異做的，不會合併到別的分支。\n\n請先確認 \`${pr.baseRefName}\` 是約定的合併目標；接續會對新的目標分支開一個新的 reviewer 從頭 review。`,
+      'review',
+    );
+    return false;
   }
 
   private async implAlive(loop: Loop): Promise<boolean> {
@@ -795,9 +862,10 @@ export class PrLoop {
     return false;
   }
 
-  private async launchReview(loop: Loop, known?: PullRequest): Promise<void> {
-    const pr = known ?? (await this.openPr(loop));
+  private async launchReview(loop: Loop, known?: PullRequest, acceptBase = false): Promise<void> {
+    const pr = known ?? (await this.openPr(loop, 'review', acceptBase));
     if (!pr) return;
+    if (known && !acceptBase && !(await this.sameBase(loop, pr))) return;
     if (!(await this.implAlive(loop))) return;
     if (loop.round >= loop.roundLimit) {
       return this.halt(loop, 'max-rounds', `已經 review ${loop.round} 輪，再開下一輪會超過上限 ${MAX_ROUNDS} 輪。`, 'review');
@@ -806,9 +874,13 @@ export class PrLoop {
     const agent = c.reviewerAgent || loop.implAgent;
     loop.round += 1;
     loop.reviewedSha = pr.headRefOid;
+    loop.reviewedBase = pr.baseRefName;
+    loop.headRef = pr.headRefName;
+    loop.baseRef = pr.baseRefName;
     loop.reviewer = null;
     loop.pendingFix = null;
     loop.fixPending = false;
+    loop.fixSending = null;
     loop.phase = 'launching';
     this.note(loop, `第 ${loop.round} 輪：為 ${short(pr.headRefOid)} 開 reviewer（${agent}）`);
     await this.save(loop);
@@ -820,14 +892,18 @@ export class PrLoop {
     const nonce = this.nonce();
     loop.reviewer = { session: id, agent, sentAt: this.now(), nonce };
     loop.phase = 'reviewing';
+    loop.since = this.now();
     await this.save(loop);
     const text = brief(this.target(loop, pr), loop.requirement, loop.notes, nonce);
     const key = loop.key;
-    void this.host.send(id, text).catch(e =>
-      this.exclusive(async () => {
-        const now = await this.loop(key);
-        if (now && now.phase === 'reviewing' && now.reviewer?.session === id) await this.halt(now, 'reviewer-failed', `brief 沒有送進 reviewer session：${(e as Error).message}`, 'review');
-      }),
+    this.background(
+      this.host.send(id, text).catch(e =>
+        this.exclusive(async () => {
+          const now = await this.loop(key);
+          if (now && now.phase === 'reviewing' && now.reviewer?.session === id) await this.halt(now, 'reviewer-failed', `brief 沒有送進 reviewer session：${(e as Error).message}`, 'review');
+        }),
+      ),
+      'reviewer brief',
     );
     await this.host.toast(`pr-loop：${loop.repo}#${loop.number} 第 ${loop.round} 輪 review 開始（${agent}）`).catch(() => {});
   }
@@ -835,6 +911,10 @@ export class PrLoop {
   private async reviewing(loop: Loop): Promise<void> {
     const r = loop.reviewer;
     if (!r) return this.halt(loop, 'interrupted', '找不到這一輪 reviewer session 的紀錄。', 'review');
+    // A reviewer's answer counts once: a round already recorded is never read again
+    if (loop.rounds.some(x => x.round === loop.round && x.reviewer === r.session)) {
+      return this.halt(loop, 'interrupted', `第 ${loop.round} 輪 reviewer session \`${r.session}\` 的結論已經記錄過，不會再讀一次。`, 'review');
+    }
     const view = await this.host.session(r.session, 20);
     if (!view) {
       const listed = (await this.host.sessions()).some(s => s.id === r.session);
@@ -843,16 +923,24 @@ export class PrLoop {
         : this.halt(loop, 'reviewer-gone', `reviewer session \`${r.session}\` 已經不在 session 清單裡。`, 'review');
     }
     const reply = lastReply(view, r.nonce);
-    if (view.running && !(reply.replied && reply.text.includes(verdictBegin(r.nonce)))) return this.save(loop);
+    const stalled = () =>
+      this.halt(
+        loop,
+        'stalled',
+        `reviewer session \`${r.session}\` 已經 ${Math.round((this.now() - Math.max(r.sentAt, loop.since)) / 60_000)} 分鐘還沒有給出結論（可能卡在權限卡片，或還在跑測試）。請到那個 session 看一下；接續會再等 ${REVIEW_WAIT_MS / 60_000} 分鐘。`,
+        'retry',
+      );
+    const waited = this.now() - Math.max(r.sentAt, loop.since);
+    if (view.running && !(reply.replied && reply.text.includes(verdictBegin(r.nonce)))) return waited > REVIEW_WAIT_MS ? stalled() : this.save(loop);
     if (!reply.asked || !reply.replied) {
       if (this.now() - r.sentAt < START_GRACE_MS) return this.save(loop);
       return this.halt(loop, 'reviewer-failed', `reviewer session \`${r.session}\` 在 ${START_GRACE_MS / 60_000} 分鐘內沒有開始或沒有回覆。`, 'review');
     }
     // A reply still streaming may not hold its block yet
-    if (view.running) return this.save(loop);
+    if (view.running) return waited > REVIEW_WAIT_MS ? stalled() : this.save(loop);
     const parsed = parseVerdict(reply.text, r.nonce);
     const record = (result: Round['result'], keys: string[] = [], blocking = 0, verdict?: Round['verdict']) =>
-      loop.rounds.push({ round: loop.round, sha: loop.reviewedSha, reviewer: r.session, at: this.now(), result, keys, blocking, ...(verdict ? { verdict } : {}) });
+      loop.rounds.push({ round: loop.round, sha: loop.reviewedSha, base: loop.reviewedBase, reviewer: r.session, at: this.now(), result, keys, blocking, ...(verdict ? { verdict } : {}) });
     // Every outcome below leaves `reviewing` in the same save as its record, so a round is never read twice
     if (!parsed.ok) {
       record('unparseable');
@@ -870,6 +958,7 @@ export class PrLoop {
       record('mergeable');
       this.note(loop, `第 ${loop.round} 輪 review 判定可合併`);
       loop.phase = 'waitingCi';
+      loop.since = this.now();
       await this.save(loop);
       return this.waitingCi(loop);
     }
@@ -893,7 +982,7 @@ export class PrLoop {
 
   // Hands the decided fix list to the implementing session, once
   private async sendFix(loop: Loop): Promise<void> {
-    const pr = await this.openPr(loop);
+    const pr = await this.openPr(loop, 'fix');
     if (!pr) return;
     if (!(await this.implAlive(loop))) return;
     const text = loop.pendingFix;
@@ -902,36 +991,78 @@ export class PrLoop {
     if ((await this.host.session(loop.implSession, 0)) === null) {
       return this.halt(loop, 'impl-closed', `實作 session \`${loop.implSession}\` 沒有在這個引擎開著，修正清單送不進去。打開那個 session 後接續。`, 'fix');
     }
+    // `fixSending` is saved before the prompt starts and cleared once it went out: found set by a later process, the
+    // engine stopped in between and the fix list may never have arrived
+    const sending = this.now();
     loop.baseSha = pr.headRefOid;
     loop.fixPending = false;
+    loop.fixSending = sending;
     loop.phase = 'waitingFix';
+    loop.since = sending;
     this.note(loop, `修正清單送回實作 session，等 ${short(pr.headRefOid)} 之後的新 commit`);
     await this.save(loop);
     const key = loop.key;
-    void this.host.send(loop.implSession, text).catch(e =>
-      this.exclusive(async () => {
-        const now = await this.loop(key);
-        if (now && now.phase === 'waitingFix') await this.halt(now, 'impl-closed', `修正清單沒有送進實作 session：${(e as Error).message}`, 'fix');
-      }),
+    this.inflight.add(key);
+    this.background(
+      this.host.send(loop.implSession, text).then(
+        () =>
+          this.exclusive(async () => {
+            this.inflight.delete(key);
+            const now = await this.loop(key);
+            if (!now || now.fixSending !== sending) return;
+            now.fixSending = null;
+            try {
+              await this.save(now);
+            } catch (e) {
+              if (!(e instanceof Aborted)) throw e;
+            }
+          }),
+        e =>
+          this.exclusive(async () => {
+            this.inflight.delete(key);
+            const now = await this.loop(key);
+            if (now && now.phase === 'waitingFix' && now.fixSending === sending) {
+              now.fixSending = null;
+              now.fixPending = true;
+              await this.halt(now, 'impl-closed', `修正清單沒有送進實作 session：${(e as Error).message}`, 'fix');
+            }
+          }),
+      ),
+      'fix list',
     );
   }
 
   private async waitingFix(loop: Loop): Promise<void> {
     if (loop.fixPending) return this.sendFix(loop);
-    const pr = await this.openPr(loop);
+    const pr = await this.openPr(loop, 'retry');
     if (!pr) return;
     if (!(await this.implAlive(loop))) return;
-    if (pr.headRefOid === loop.baseSha) return this.save(loop);
-    this.note(loop, `看到新的 head ${short(pr.headRefOid)}`);
-    return this.launchReview(loop, pr);
+    if (pr.headRefOid !== loop.baseSha) {
+      this.note(loop, `看到新的 head ${short(pr.headRefOid)}`);
+      return this.launchReview(loop, pr);
+    }
+    if (loop.fixSending !== null && !this.inflight.has(loop.key)) {
+      loop.fixSending = null;
+      loop.fixPending = true;
+      return this.halt(loop, 'interrupted', '送修正清單的途中引擎停止了，不確定實作 session 有沒有收到。可以到實作 session 確認；接續會再送一次修正清單。', 'fix');
+    }
+    if (this.now() - loop.since > FIX_WAIT_MS) {
+      return this.halt(
+        loop,
+        'stalled',
+        `修正清單送出後 ${Math.round((this.now() - loop.since) / 60_000)} 分鐘，PR 的 head 還是 \`${short(loop.baseSha)}\`，實作 session 沒有 push 新的 commit。請到實作 session 看一下；接續會再等 ${FIX_WAIT_MS / 3_600_000} 小時。`,
+        'retry',
+      );
+    }
+    return this.save(loop);
   }
 
   private async waitingCi(loop: Loop): Promise<void> {
-    const pr = await this.openPr(loop);
+    const pr = await this.openPr(loop, 'ci');
     if (!pr) return;
     if (!(await this.implAlive(loop))) return;
-    if (!passed(loop, pr.headRefOid)) {
-      // Nothing but a passing verdict on this very head leads on to CI and the merge
+    if (!passed(loop, pr.headRefOid, pr.baseRefName)) {
+      // Nothing but a passing verdict on this very head and target branch leads on to CI and the merge
       this.note(loop, `head ${short(pr.headRefOid)} 沒有最新一輪「可合併」的 review，重新 review`);
       return this.launchReview(loop, pr);
     }
@@ -939,6 +1070,9 @@ export class PrLoop {
     if (ci.state !== 'none') loop.noCiSince = null;
     if (ci.state === 'pending') {
       loop.phase = 'waitingCi';
+      if (this.now() - loop.since > CI_WAIT_MS) {
+        return this.halt(loop, 'stalled', `CI 已經跑了 ${Math.round((this.now() - loop.since) / 60_000)} 分鐘還沒有結果（還在跑：${ci.pending.join('、') || '未知'}）。接續會再等 ${CI_WAIT_MS / 3_600_000} 小時。`, 'ci');
+      }
       return this.save(loop);
     }
     if (ci.state === 'fail') {
@@ -991,41 +1125,48 @@ export class PrLoop {
       `pr-loop：${loop.repo}#${loop.number}「${loop.title}」可以合併了。`,
       `- 第 ${last.round} 輪獨立 review（reviewer session \`${last.reviewer}\`，commit \`${short(last.sha)}\`）的結論：${ROUND_TEXT[last.result]}，${last.blocking} 個 blocking`,
       `- ${ciText}`,
-      `- 會用一般 merge commit 合併 \`${loop.headRef}\` → \`${loop.baseRef}\`，只合併 review 過的 commit \`${short(last.sha)}\`；不 squash、不 rebase、不刪分支`,
+      `- 會用一般 merge commit 合併 \`${loop.headRef}\` → \`${last.base}\`（review 時的目標分支），只合併 review 過的 commit \`${short(last.sha)}\`；不 squash、不 rebase、不刪分支`,
       '',
       '要現在合併嗎？',
     ].join('\n');
     const key = loop.key;
     const createdAt = loop.createdAt;
-    this.asking.add(key);
-    void this.host
-      .ask(loop.implSession, message, [{ id: 'merge', label: '合併' }, { id: 'later', label: '先不要' }], ASK_WAIT_SECS)
-      .then(
-        a => a,
-        () => 'failed' as const,
-      )
-      .then(answer =>
-        this.exclusive(async () => {
-          this.asking.delete(key);
-          const now = await this.loop(key);
-          if (!now || now.createdAt !== createdAt || now.phase !== 'confirmMerge') return;
-          if (answer === 'merge') {
-            this.note(now, '使用者確認合併');
-            return this.guarded(now, async () => {
-              const pr = await this.openPr(now);
-              if (pr) await this.merge(now, pr);
-            }, 'ci');
-          }
-          const why = answer === 'failed' ? '確認卡片沒辦法顯示在實作 session（session 沒有開著？）。' : answer === null ? '確認卡片逾時沒有回應。' : '你選了先不要合併。';
-          return this.halt(now, 'merge-declined', `${why}條件仍然滿足時，接續會重新檢查並再問一次。`, 'ci');
-        }),
-      );
+    const card = ++this.cardSeq;
+    this.asking.set(key, card);
+    this.background(
+      this.host
+        .ask(loop.implSession, message, [{ id: 'merge', label: '合併' }, { id: 'later', label: '先不要' }], ASK_WAIT_SECS)
+        .then(
+          a => a,
+          () => 'failed' as const,
+        )
+        .then(answer =>
+          this.exclusive(async () => {
+            // Only this card's own mark is cleared: a newer card for the same PR stays the open one
+            if (this.asking.get(key) !== card) return;
+            this.asking.delete(key);
+            const now = await this.loop(key);
+            if (!now || now.createdAt !== createdAt || now.phase !== 'confirmMerge') return;
+            if (answer === 'merge') {
+              this.note(now, '使用者確認合併');
+              return this.guarded(now, async () => {
+                const pr = await this.openPr(now, 'ci');
+                if (pr) await this.merge(now, pr);
+              }, 'ci');
+            }
+            const why = answer === 'failed' ? '確認卡片沒辦法顯示在實作 session（session 沒有開著？）。' : answer === null ? '確認卡片逾時沒有回應。' : '你選了先不要合併。';
+            return this.halt(now, 'merge-declined', `${why}條件仍然滿足時，接續會重新檢查並再問一次。`, 'ci');
+          }),
+        ),
+      'merge card',
+    );
   }
 
   // The merge, re-checked against GitHub first: the newest round passed for this very head, no failing or pending CI,
   // still allowed
   private async merge(loop: Loop, pr: PullRequest): Promise<void> {
-    if (!passed(loop, pr.headRefOid)) {
+    if (!(await this.sameBase(loop, pr))) return;
+    if (!passed(loop, pr.headRefOid, pr.baseRefName)) {
       this.note(loop, `合併前發現 head ${short(pr.headRefOid)} 沒有最新一輪「可合併」的 review，重新 review`);
       return this.launchReview(loop, pr);
     }
@@ -1052,21 +1193,26 @@ export class PrLoop {
     } catch (e) {
       failure = (e as Error).message;
     }
-    // Whatever gh said, GitHub's state decides: a merge that failed on the way back may still have happened
+    // Whatever gh said, GitHub's state decides: a merge that failed on the way back may still have happened. A failure
+    // reading it stops in `merging`, and resuming from there asks GitHub again before anything else
     const after = await this.gh.pr(loop.number, loop.repo);
     if (after.state !== 'MERGED') {
+      loop.phase = 'waitingCi';
       return this.halt(loop, 'gh', failure ? `合併失敗：${failure}` : `合併指令回報成功，但 PR 的狀態是 ${after.state}。`, 'ci');
     }
     return this.finishMerge(loop, after);
   }
 
+  // A loop found in `merging` (or resumed from a stop there): merged means done, anything else a stop, never a second
+  // merge
   private async recoverMerge(loop: Loop): Promise<void> {
     const pr = await this.gh.pr(loop.number, loop.repo);
     if (pr.state === 'MERGED') {
-      this.note(loop, '引擎重啟後確認 PR 已合併');
+      this.note(loop, '確認 PR 已經合併');
       return this.finishMerge(loop, pr);
     }
-    return this.halt(loop, 'interrupted', `合併途中引擎停止了，PR 目前是 ${pr.state}，沒有被合併。不會自動再合併一次。`, 'ci');
+    loop.phase = 'waitingCi';
+    return this.halt(loop, 'interrupted', `合併這一步中途中斷了，PR 目前是 ${pr.state}，沒有被合併。不會自動再合併一次；接續會重新檢查 review 結論、CI 與合併條件。`, 'ci');
   }
 
   private async finishMerge(loop: Loop, pr: PullRequest): Promise<void> {
@@ -1091,7 +1237,8 @@ export class PrLoop {
 
   async statusText(ref: string | null, session: string): Promise<string> {
     const all = (await this.loops()).sort((a, b) => b.updatedAt - a.updatedAt);
-    const shown = ref ? all.filter(l => l.url === ref || String(l.number) === ref.replace(/^#/, '')) : all.filter(l => isActive(l) || l.phase === 'stopped' || l.implSession === session);
+    const one = ref ? pickLoop(all, session, ref) : null;
+    const shown = ref ? (one ? [one] : []) : all.filter(l => isActive(l) || l.phase === 'stopped' || l.implSession === session);
     if (!shown.length) return 'pr-loop：沒有循環。';
     return shown
       .map(l =>
@@ -1113,6 +1260,20 @@ export class PrLoop {
 
 // A step that must not write: the loop was cancelled, or another engine runs it
 class Aborted extends Error {}
+
+// The loop a `[PR]` argument names: a URL matches repo (with host) and number exactly; a bare number matches the
+// session's own loop first and must not be ambiguous across repositories
+function pickLoop(loops: Loop[], session: string, ref: string): Loop | null {
+  const byUrl = parsePrUrl(ref);
+  if (byUrl) return loops.find(l => sameRepo(l.repo, byUrl.repo) && l.number === byUrl.number) ?? null;
+  const m = /^#?(\d+)$/.exec(ref.trim());
+  if (!m) throw new Error(`\`${ref}\` 不是 PR 編號或網址。`);
+  const hits = loops.filter(l => l.number === Number(m[1]));
+  const mine = hits.filter(l => l.implSession === session);
+  const pool = mine.length ? mine : hits;
+  if (new Set(pool.map(l => l.key)).size > 1) throw new Error(`有多個 repo 的 #${m[1]}（${pool.map(l => l.repo).join('、')}），請改用 PR 網址。`);
+  return pool[0] ?? null;
+}
 
 const SOURCE_TEXT: Record<Loop['requirementSource'], string> = {
   command: '指令參數',

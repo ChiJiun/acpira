@@ -13,9 +13,9 @@
 
    brief 不放 PR 描述的其他段落與實作者對正確性的結論。它要求 reviewer 只讀、以程式碼和實際測試結果為準，並在回覆最後輸出固定格式的結論區塊（見下面）。reviewer 用哪個 agent 可以設定。
 4. **退回修正**：有 blocking 項目時，把它們整理成修正清單送回實作 session，等 PR 的 head commit 改變（實作 session push 了新 commit）後，再開新的 reviewer 重審。
-5. **CI**：review 通過後用 `gh pr checks` 檢查。還在跑就等；失敗就把失敗的檢查送回實作 session，修完後重新 review。`gh` 回報「沒有檢查」時要持續 2 分鐘（同一個 head）才視為「repo 沒有 CI」，因為剛 push 時檢查可能還沒註冊。
-6. **合併**：只有「最新一輪 review 的紀錄是可合併（沒有 blocking），而且那一輪 review 的 commit 就是 PR 目前的 head」才會往 CI 與合併走；進入 CI 檢查、出確認卡片、真正合併前都會再檢查一次，不符合就開新的 reviewer 重審，不會合併。合併一律是 `gh pr merge <n> --repo <repo> --merge --match-head-commit <reviewed sha>`：一般 merge commit，只合併 review 過的 commit。不使用 `--auto`、`--squash`、`--rebase`，不刪分支，不 force push（`src/github.ts` 的 `guardArgs` 是每個子指令固定形狀的正向白名單，其他參數一律拒絕）。預設合併前出確認卡片，卡片內容取自那一輪的實際紀錄（輪次、reviewer session、commit、blocking 數）；可以改成條件都滿足時自動合併。`gh pr merge` 跑完後（不論成功失敗）都再用 `gh pr view` 確認狀態是 `MERGED` 才算完成，否則停下。合併後回報 merge commit 與合併內容。
-7. **停下來通知你**：循環超過 5 輪、連續兩輪退回同一類問題、CI 連續兩次在同一個檢查失敗、reviewer 輸出無法解析、reviewer 回報互相衝突的意見、`gh` 失敗或未登入、PR 被關閉或被別人合併、實作或 reviewer session 不見了、實作 session 沒有在這個引擎開著（修正清單送不進去）、引擎在開 reviewer 或合併途中停止。停下時在實作 session 出一張卡片，說明卡在哪裡、已經做了什麼、建議的選項（接續／停止循環／稍後決定）。接續時回到停下的那一步；接續途中再失敗，會停在同一步、保留同一種接續方式，不會跳到 CI 或合併。
+5. **CI**：review 通過後用 `gh pr checks` 檢查。還在跑就等；失敗就把失敗的檢查送回實作 session，修完後重新 review。結果只看 `gh pr checks --json` 每個檢查的 `bucket` 欄位；檢查的名稱與描述是 PR 分支自己的 workflow 決定的，不拿來判斷任何狀態。不認得的 `bucket` 當成還在跑。只有 stdout 沒有 JSON、而 stderr 開頭是 gh 自己的「no checks reported」時才算「沒有檢查」，而且要持續 2 分鐘（同一個 head）才視為「repo 沒有 CI」，因為剛 push 時檢查可能還沒註冊。
+6. **合併**：只有「最新一輪 review 的紀錄是可合併（沒有 blocking），而且那一輪 review 的 commit 就是 PR 目前的 head、review 時的目標分支就是 PR 目前的目標分支」才會往 CI 與合併走；進入 CI 檢查、出確認卡片、真正合併前都會再檢查一次，不符合就開新的 reviewer 重審，不會合併。PR 的目標分支在 review 之後被改掉（例如 `gh pr edit --base`）時一律停下來問你，不會自動重審後合併到新的分支；接續代表你確認新的目標分支是約定的合併目標，會對它開新的 reviewer 從頭 review。合併一律是 `gh pr merge <n> --repo <repo> --merge --match-head-commit <reviewed sha>`：一般 merge commit，只合併 review 過的 commit。不使用 `--auto`、`--squash`、`--rebase`，不刪分支，不 force push（`src/github.ts` 的 `guardArgs` 是每個子指令固定形狀的正向白名單，其他參數一律拒絕）。預設合併前出確認卡片，卡片內容取自那一輪的實際紀錄（輪次、reviewer session、commit、blocking 數）；可以改成條件都滿足時自動合併。`gh pr merge` 跑完後（不論成功失敗）都再用 `gh pr view` 確認狀態是 `MERGED` 才算完成，否則停下。合併後回報 merge commit 與合併內容。
+7. **停下來通知你**：循環超過 5 輪、連續兩輪退回同一類問題、CI 連續兩次在同一個檢查失敗、reviewer 輸出無法解析、reviewer 回報互相衝突的意見、`gh` 失敗或未登入、PR 被關閉或被別人合併、實作或 reviewer session 不見了、實作 session 沒有在這個引擎開著（修正清單送不進去）、PR 的目標分支和 review 時不同、等太久沒有進展（reviewer 60 分鐘沒有結論、修正清單送出後 4 小時沒有新的 push、CI 2 小時沒有結果）、引擎在開 reviewer、送修正清單或合併途中停止。停下時在實作 session 出一張卡片，說明卡在哪裡、已經做了什麼、建議的選項（接續／停止循環／稍後決定）。接續時回到停下的那一步；接續途中再失敗，會停在同一步、保留同一種接續方式，不會跳到 CI 或合併。停在合併這一步的循環，接續時一定先問 GitHub 是否已經合併。每次停下都會出一張新卡片；舊卡片只對它描述的那一次停下有效，之後再按不會有作用。
 
 ## 安裝
 
@@ -37,7 +37,7 @@ Acpira 只從資料目錄的 `plugins/<id>/`（預設 `~/.acpira/plugins/pr-loop
 | `/pr-loop config allow <owner>/<repo>` | 加入允許自動循環（含合併）的 repo；github.com 以外的 host 寫成 `<host>/<owner>/<repo>` | 空清單：任何 PR 都不會啟動 |
 | `/pr-loop config disallow <owner>/<repo>` | 移出清單 | |
 | `/pr-loop config reviewer <agent id>` / `same` | reviewer 用的 agent（例如實作用 `claude`、review 用 `codex`） | 與實作 session 相同 |
-| `/pr-loop config merge confirm` / `auto` | 合併前出確認卡片／條件都滿足時自動合併 | `confirm` |
+| `/pr-loop config merge confirm` / `auto` | 合併前出確認卡片／條件都滿足時自動合併（建議：在真實引擎上完整跑通過一輪之前維持 `confirm`，不要用 `auto`） | `confirm` |
 | `/pr-loop config poll <秒>` | 輪詢 PR 與 CI 的間隔（5–3600） | 30 |
 | `/pr-loop config same-issue category+file` / `category` | 「同一類問題」的判定方式 | `category+file` |
 | `/pr-loop config gh <argv>` | 執行 gh 的指令，例如 `["node","C:/tools/fake-gh.mjs"]`（測試用） | `["gh"]` |
@@ -51,6 +51,7 @@ Acpira 只從資料目錄的 `plugins/<id>/`（預設 `~/.acpira/plugins/pr-loop
 ## 指令
 
 - `/pr-loop <PR 編號或網址> [需求原文]`：開始循環。編號會在實作 session 的資料夾用 `gh pr view` 解析成 repo；用網址最明確。
+- `[PR]` 參數：網址會比對 host、owner、repo 與編號，全部相同才算；只給編號時先找這個 session 的循環，多個 repo 有同一個編號就要求改用網址。
 - `/pr-loop status [PR]`：狀態（階段、第幾輪、每一輪的結論、停下原因）。
 - `/pr-loop stop [PR]`：停止循環（不刪除已開的 reviewer session，不合併）。
 - `/pr-loop resume [PR]`：接續停下的循環。接續會做什麼，停下的卡片和 `status` 都會寫出來：開新的 reviewer、送出修正清單、重新檢查 CI 與合併條件，或重試卡住的那一步。超過 5 輪或同類問題重複時，接續代表你同意再多跑一輪。
@@ -65,11 +66,13 @@ Acpira 只從資料目錄的 `plugins/<id>/`（預設 `~/.acpira/plugins/pr-loop
 2. PR 描述中標題含「需求原文」的段落（`## 需求原文`）。
 3. 實作 session 的第一則使用者訊息（`/pr-loop` 指令本身除外）。
 
-都沒有就不啟動。循環開始時就把需求原文存下來，之後不會再變。用了哪個來源會寫在開始的卡片與 `status`。
+都沒有就不啟動。循環開始時就把需求原文存下來，之後不會再變。用了哪個來源會寫在開始的卡片與 `status`，開始的卡片也會顯示送給 reviewer 的需求原文（太長時只顯示前 1200 字）。
+
+注意第 2 個來源：PR 描述是實作者自己寫的，等於讓被審的一方決定 reviewer 拿什麼標準審。取自 PR 描述時開始的卡片會特別提醒；不是你的需求就 `/pr-loop stop`，再用指令參數附上需求原文重新開始。最穩當的做法是一律在指令後面附上需求原文。
 
 ## reviewer 結論的固定格式
 
-每一輪的 brief 都帶一個隨機的 nonce（16 個十六進位字元）。reviewer 回覆的最後要有一個區塊，`PR-LOOP-VERDICT-BEGIN:<nonce>:` 與 `PR-LOOP-VERDICT-END:<nonce>:` 各自單獨一行，中間是一個 JSON 物件（可以包在 ```json 圍欄裡）：
+每一輪的 brief 都帶一個隨機的 nonce（16 個十六進位字元，用 `crypto.randomBytes` 產生）。reviewer 回覆的最後要有一個區塊，`PR-LOOP-VERDICT-BEGIN:<nonce>:` 與 `PR-LOOP-VERDICT-END:<nonce>:` 各自單獨一行，中間是一個 JSON 物件（可以包在 ```json 圍欄裡）：
 
 ```
 PR-LOOP-VERDICT-BEGIN:3f9a0c1d7e2b4a65:
@@ -102,6 +105,7 @@ reviewer 每一輪都是全新的，看不到上一輪的意見，所以這個�
   - `launching`：不確定 reviewer 是否已經開好，停下來問你，不會自動再開一個。
   - `merging`：用 `gh pr view` 確認；已合併就回報，沒合併就停下，不會自動再合併。
 - `reviewing` 階段重啟後，如果 reviewer session 已經不在這個引擎開著（讀不到它的結論），停下來問你，不會自動開新的 reviewer。
+- 送修正清單前先存「正在送」，送出後才清掉；重啟後看到還在「正在送」而 head 沒變，表示不確定實作 session 有沒有收到，停下來問你（接續會再送一次）。
 - `waitingFix`、`waitingCi` 重啟後直接接續；`confirmMerge` 重啟後重新檢查條件並再出一次確認卡片。
 - 結束的循環保留最近 20 個，供 `status` 查看。
 
@@ -112,8 +116,10 @@ reviewer 每一輪都是全新的，看不到上一輪的意見，所以這個�
 - 讀 reviewer 結論靠 `turn.ended` 事件與輪詢 `session/get`；事件可能在佇列滿時被丟掉，輪詢會補上（最多晚一個輪詢間隔）。
 - 實作 session 修完後要自己 push；外掛只看 PR 的 head commit 有沒有變，不檢查 push 的內容。
 - 「需要先問我」的情況（主 repo、force push、刪分支）一律不做：允許清單外不啟動，gh 呼叫經過 `guardArgs` 白名單。
+- **卡片也可能不是你按的**：其他外掛可以用 `session/act answer` 回答任何 session 的問題卡片（`rust/crates/acpira-host/src/plugins/host_api.rs` 的 `answer` 動作），包括設定確認卡片、合併確認卡片與停下的卡片。所以這些卡片防的是「不經意的指令」，不是「惡意的外掛」：只安裝你信任的外掛。
+- **等待逾時**：reviewer 60 分鐘、修正 4 小時、CI 2 小時沒有進展就停下通知（接續會重新計時）；目前不能設定。
 - 卡片最多等 25 分鐘（引擎上限）；合併確認逾時就停下，`/pr-loop resume` 會重新檢查並再問一次。資訊卡片（指令回覆）開著的時候實作 session 不會被閒置釋放，最多 10 分鐘。
-- **指令來源**：Acpira 的 `command` hook 不分辨 `/pr-loop` 是使用者在輸入框打的，還是其他外掛用 `session/act send` 送進 session 的文字。所以會放寬限制的設定都要先按確認卡片；`/pr-loop <PR>`、`stop`、`resume` 不需要確認（允許清單與合併確認卡片仍然有效）。agent 自己無法送出 `/pr-loop`（它的輸出不會被當成指令），但其他外掛可以。
+- **指令來源**：Acpira 的 `command` hook 不分辨 `/pr-loop` 是使用者在輸入框打的，還是其他外掛用 `session/act send` 送進 session 的文字。所以會放寬限制的設定都要先按確認卡片（但見上一項：卡片本身也可能被其他外掛回答）；`/pr-loop <PR>`、`stop`、`resume` 不需要確認（允許清單與合併確認卡片仍然有效）。agent 自己無法送出 `/pr-loop`（它的輸出不會被當成指令），但其他外掛可以。
 - **送到沒開著的 session**：引擎把送往「不在這個引擎開著」的 session 的訊息直接丟掉，不回傳錯誤（`rust/crates/acpira-host/src/session_manager/dispatch.rs` 約 77–84 行，log 為 "dropped: not live"）。所以送修正清單前會先用 `session/get` 確認實作 session 開著，沒開著就停下（`impl-closed`）；但「確認後、送出前」被關掉的競態仍然偵測不到，只能靠之後的輪詢發現 head 沒變。
 - **reviewer 回覆的來源**：外掛只讀得到 session 的對話紀錄，分不出一則 agent 回覆是 reviewer agent 自己產生的，還是被其他外掛插入的訊息影響。nonce 與「只讀 brief 之後的回覆」降低了偽造的機會，但不是密碼學上的保證。
 - **合併後的狀態**：`gh pr merge` 之後一定再讀一次 PR；狀態不是 `MERGED` 就停下（`gh` 失敗），不會記成已合併。
