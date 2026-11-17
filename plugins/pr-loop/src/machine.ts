@@ -7,18 +7,22 @@
 // those outside a running step means the engine stopped mid-step, so the loop stops and says where instead of redoing it.
 //
 // The merge invariant: `gh pr merge` runs only while the newest round's verdict is `mergeable` for exactly the PR's
-// current head (`passed`). Nothing else (a phase, a resume, a stored sha) stands in for it
+// current head (`passed`). Nothing else (a phase, a resume, a stored sha) stands in for it.
+//
+// The stop invariant: every step that moves the loop on (a review round opened, a fix list sent, CI waited on, the
+// merge) first asks `gate`, which asks the pure `mustStop` (gate.ts) over the raw facts of every round, and stops on
+// everything it returns at once. Only the user's consent to a stop that named a hold lets that hold through
 
 import { randomBytes } from 'node:crypto';
+import { effectiveResult, issueKeyList, mustStop, type CiRun, type Issue, type RoundFacts, type Transition } from './gate';
 import { GhError, parsePrUrl, type GitHub, type PullRequest } from './github';
 import {
   brief,
   ciFailure,
   fixList,
-  issueKey,
   NOTES_TITLES,
+  oneLine,
   parseVerdict,
-  repeatedKeys,
   REQUIREMENT_TITLES,
   section,
   verdictBegin,
@@ -97,7 +101,10 @@ export const REVIEW_WAIT_MS = 60 * 60_000;
 export const FIX_WAIT_MS = 4 * 60 * 60_000;
 export const CI_WAIT_MS = 2 * 60 * 60_000;
 const LOG_MAX = 40;
+// Merged loops kept beyond this many are let go; any loop that is not running (stopped and cancelled included) is let
+// go once nothing happened to it for RETAIN_MS. Until then a restart of the same PR carries its rounds on
 const KEEP_FINISHED = 20;
+export const RETAIN_MS = 30 * 24 * 60 * 60_000;
 const ASK_WAIT_SECS = 25 * 60;
 const CONFIRM_WAIT_SECS = 5 * 60;
 
@@ -121,6 +128,7 @@ export type StopReason =
   | 'merge-conflict'
   | 'not-allowed'
   | 'base-changed'
+  | 'force-push'
   | 'stalled'
   | 'error';
 
@@ -128,32 +136,34 @@ export type StopReason =
 // step that failed retried
 export type Resume = 'review' | 'fix' | 'ci' | 'retry';
 
-export interface Round {
-  round: number;
-  sha: string;
+// A review round as it happened: what the reviewer said, never a value derived from a setting (`mustStop` derives what
+// it needs each time). A `conflict` round keeps `result: 'conflict'` for good; the user accepting it is a consent
+// (`conflict:<round>`), not a rewrite of the round
+export interface Round extends RoundFacts {
   // The branch the PR targeted when this round was reviewed: the diff the reviewer saw
   base: string;
   reviewer: string;
   at: number;
-  result: 'mergeable' | 'not_mergeable' | 'unparseable' | 'conflict';
-  // What a `conflict` round's reviewer judged; the user accepting it on resume turns the round into that result
-  verdict?: 'mergeable' | 'not_mergeable';
-  keys: string[];
+  conflicts: string[];
   blocking: number;
 }
 
 export interface Stop {
+  // The first reason; `also` holds the others that held at the same time, and the card names them all
   reason: StopReason;
+  also: StopReason[];
   step: Phase;
   detail: string;
   resume: Resume | null;
   at: number;
   // Names this stop; a stop card acts only on the stop it was shown for
   id: string;
-  // Other reasons that held at the same time; the card names them all
-  also?: StopReason[];
-  // The card said resuming goes past the round limit: resuming grants exactly one more round
-  grantRound?: boolean;
+  // The holds this stop named, by token: resuming from it records exactly these as the user's consent
+  consents: string[];
+  // The stop said resuming goes past the round limit: resuming grants exactly one more round
+  grantRound: boolean;
+  // What resuming agrees to, as the card said it; non-empty means `/pr-loop resume` needs `confirm`
+  agree: string[];
 }
 
 export interface Loop {
@@ -187,7 +197,15 @@ export interface Loop {
   fixSending: number | null;
   // When the current wait on someone else began (a reviewer, a fix, CI); a resume starts it again
   since: number;
-  lastCiFail: string[] | null;
+  // Settings that decide a stop, fixed when the loop starts: a later `config` change never turns a hold off (or on) for
+  // a loop already running
+  policy: { sameIssue: SameIssue };
+  // Holds the user agreed to on a stop that named them (tokens from `mustStop`)
+  consents: string[];
+  // Every CI result the loop saw, one per head
+  ciRuns: CiRun[];
+  // Where the pending fix list came from
+  fixFrom: 'review' | 'ci' | null;
   // When "no checks" was first seen for the current head
   noCiSince: { sha: string; at: number } | null;
   stop: Stop | null;
@@ -220,7 +238,7 @@ const PHASE_TEXT: Record<Phase, string> = {
 };
 
 const REASON_TEXT: Record<StopReason, string> = {
-  'max-rounds': `已經 review ${MAX_ROUNDS} 輪仍未通過`,
+  'max-rounds': 'review 輪數已達上限',
   repeated: '連續兩輪退回同一類問題',
   unparseable: 'reviewer 的輸出無法解析',
   conflict: 'reviewer 回報互相衝突、需要你決定的意見',
@@ -237,6 +255,7 @@ const REASON_TEXT: Record<StopReason, string> = {
   'merge-conflict': 'PR 與目標分支有衝突',
   'not-allowed': 'PR 所在的 repo 不在允許清單',
   'base-changed': 'PR 的目標分支和 review 時不同',
+  'force-push': 'PR 分支的歷史被改寫（force push）',
   stalled: '等太久沒有進展',
   error: '外掛內部錯誤',
 };
@@ -251,11 +270,14 @@ const RESUME_TEXT: Record<Resume, string> = {
 export const keyOf = (repo: string, number: number) => `${repo.toLowerCase()}#${number}`;
 const short = (sha: string) => sha.slice(0, 8);
 const REQUIREMENT_SHOWN = 1200;
-const quote = (text: string) =>
-  (text.length > REQUIREMENT_SHOWN ? `${text.slice(0, REQUIREMENT_SHOWN)}…（共 ${text.length} 字，後面省略）` : text)
-    .split('\n')
+// Text that came from someone else (a requirement, a reviewer, a PR, gh) as a block quote on a card: every line of it
+// starts with `> `, so none of it can pass for the card's own lines (its reasons or its options)
+const quote = (text: string, max = REQUIREMENT_SHOWN) =>
+  (text.length > max ? `${text.slice(0, max)}…（共 ${text.length} 字，後面省略）` : text)
+    .split(/\r?\n|\r/)
     .map(l => `> ${l}`)
     .join('\n');
+const FIX_SHOWN = 4000;
 const sameRepo = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
 // The reply to the prompt carrying `nonce`: the agent turns after that user turn, up to the next user turn (a later
@@ -288,27 +310,35 @@ export function lastReply(view: SessionView, nonce: string): { asked: boolean; r
   return { asked: true, replied: after.length > 0, text, error, stop };
 }
 
-// What pressing "resume" agrees to, written on the card: only these are let through by it
-function resumeConsent(loop: Loop, reason: StopReason, also: StopReason[], grantRound: boolean): string {
-  const all = [reason, ...also];
-  const parts: string[] = [];
-  if (all.includes('conflict')) parts.push('照 reviewer 的判斷處理它回報的衝突');
-  if (all.includes('repeated')) parts.push('在同一類問題重複的情況下繼續修正');
-  if (grantRound) parts.push(`超過上限 ${loop.roundLimit} 輪，再多 review 一輪（第 ${loop.round + 1} 輪）`);
-  return parts.length ? `。按接續代表你同意：${parts.join('；')}` : '';
-}
+// A resume that lets a hold through: from a command it takes `/pr-loop resume confirm`
+const needsConsent = (stop: Stop) => stop.consents.length > 0 || stop.grantRound;
 
-// What a round's reviewer judged, a `conflict` round included; null for a round without a verdict
-function verdictOf(r: Round): 'mergeable' | 'not_mergeable' | null {
-  if (r.result === 'mergeable' || r.result === 'not_mergeable') return r.result;
-  return r.result === 'conflict' ? (r.verdict ?? null) : null;
-}
+const reasonsOf = (stop: Stop): StopReason[] => [stop.reason, ...stop.also];
 
 // The newest round passed review for exactly `sha` against exactly the target branch `base`: the only ground for a
-// merge or a merge card
+// merge or a merge card. A conflict round counts only once the user accepted its verdict
 export function passed(loop: Loop, sha: string, base: string): boolean {
   const last = loop.rounds[loop.rounds.length - 1];
-  return !!last && last.round === loop.round && last.result === 'mergeable' && !!sha && last.sha === sha && !!base && last.base === base;
+  return !!last && last.round === loop.round && effectiveResult(last, loop.consents) === 'mergeable' && !!sha && last.sha === sha && !!base && last.base === base;
+}
+
+// A loop written by an earlier version of the plugin, filled in so every field the steps read is there
+function normalize(l: Loop): Loop {
+  l.policy ??= { sameIssue: 'category' };
+  l.consents ??= [];
+  l.ciRuns ??= [];
+  l.fixFrom ??= null;
+  for (const r of l.rounds ?? []) {
+    r.issues ??= [];
+    r.conflicts ??= [];
+  }
+  if (l.stop) {
+    l.stop.also ??= [];
+    l.stop.consents ??= [];
+    l.stop.agree ??= [];
+    l.stop.grantRound ??= false;
+  }
+  return l;
 }
 
 const randomNonce = () => randomBytes(8).toString('hex');
@@ -369,7 +399,9 @@ export class PrLoop {
 
   private async state(): Promise<State> {
     const s = await this.store.get<State>('state');
-    return s && s.loops ? s : { version: 1, loops: {} };
+    if (!s || !s.loops) return { version: 1, loops: {} };
+    for (const l of Object.values(s.loops)) normalize(l);
+    return s;
   }
 
   async loops(): Promise<Loop[]> {
@@ -390,9 +422,10 @@ export class PrLoop {
     throw new Error('the loop state kept changing under this engine');
   }
 
-  // Writes the loop back. A loop cancelled meanwhile stays cancelled, and one another engine owns and still writes is
-  // not overwritten; `claim` (a user's command, a takeover) takes it over instead
-  private async save(loop: Loop, claim = false): Promise<void> {
+  // Writes the loop back. A loop cancelled meanwhile stays cancelled, one another engine owns and still writes is not
+  // overwritten, and neither is a newer loop for the same PR; `claim` (a user's command, a takeover) takes it over.
+  // `merged` records a merge that happened: GitHub already did it, so nothing here may turn it away but a newer loop
+  private async save(loop: Loop, claim = false, merged = false): Promise<void> {
     loop.updatedAt = this.now();
     loop.heartbeat = this.now();
     loop.log = loop.log.slice(-LOG_MAX);
@@ -400,7 +433,11 @@ export class PrLoop {
     let abort: string | null = null;
     await this.update(s => {
       const stored = s.loops[loop.key];
-      if (stored && stored.createdAt === loop.createdAt) {
+      if (stored && stored.createdAt > loop.createdAt) {
+        abort = 'a newer loop for this PR started';
+        return;
+      }
+      if (stored && stored.createdAt === loop.createdAt && !merged) {
         if (stored.phase === 'cancelled' && loop.phase !== 'cancelled') {
           abort = 'the loop was cancelled';
           return;
@@ -411,9 +448,12 @@ export class PrLoop {
         }
       }
       s.loops[loop.key] = loop;
-      // Finished loops beyond the newest few are let go, so the store stays small
-      const done = Object.values(s.loops).filter(l => !isActive(l) && l.phase !== 'stopped').sort((a, b) => b.updatedAt - a.updatedAt);
-      for (const l of done.slice(KEEP_FINISHED)) delete s.loops[l.key];
+      // The store stays small: old merged loops beyond the newest few, and anything not running that sat untouched
+      // for RETAIN_MS (a stop nobody came back to included), are let go
+      const done = Object.values(s.loops).filter(l => !isActive(l) && l.key !== loop.key);
+      for (const l of done) if (this.now() - l.updatedAt > RETAIN_MS) delete s.loops[l.key];
+      const merges = done.filter(l => l.phase === 'merged' && s.loops[l.key]).sort((a, b) => b.updatedAt - a.updatedAt);
+      for (const l of merges.slice(KEEP_FINISHED)) delete s.loops[l.key];
     });
     if (abort) throw new Aborted(abort);
   }
@@ -514,6 +554,9 @@ export class PrLoop {
         change = c => {
           c.sameIssue = value;
         };
+        // A loop takes this setting when it starts and keeps it: a running loop is never changed by it. `category+file`
+        // counts fewer problems as the same kind (fewer stops) for loops started later, so it is confirmed first
+        if (value === 'category+file') loosens = '之後新開的循環改用「類別＋檔案」判定同一類問題（比只看類別寬鬆，停下的次數會變少；已經在跑的循環不受影響）';
         break;
       case 'gh': {
         let argv: unknown;
@@ -559,15 +602,37 @@ export class PrLoop {
   private async cancel(session: string, ref: string | null): Promise<void> {
     const loop = await this.findLoop(session, ref, l => isActive(l) || l.phase === 'stopped');
     if (!loop) return this.say(session, 'pr-loop：沒有進行中或停下的循環可以停止。');
+    // `gh pr merge` may be running in this or another engine: cancelling now would not stop it, only lose its report
+    if (loop.phase === 'merging') {
+      return this.say(session, `pr-loop：${loop.repo}#${loop.number} 正在合併，這一步不能停止。合併結束後會回報結果；之後可以用 \`/pr-loop status\` 查看。`, 'warning');
+    }
     loop.phase = 'cancelled';
     this.note(loop, '使用者停止了循環');
     await this.save(loop, true);
     await this.say(session, `pr-loop：已停止 ${loop.repo}#${loop.number} 的循環。已開的 reviewer session 不會被刪除；PR 不會被合併。`);
   }
 
-  private async resumeCmd(session: string, ref: string | null): Promise<void> {
+  // `/pr-loop resume [confirm] [PR]`. A stop whose resume lets a hold through (conflicts, a repeated issue, a round past
+  // the limit, rewritten history) takes `confirm`: the command may come from another plugin's prompt, so agreeing is
+  // never implied by it. The stop card's own button is the other way to agree
+  private async resumeCmd(session: string, args: string | null): Promise<void> {
+    const words = (args ?? '').split(/\s+/).filter(Boolean);
+    const confirm = words[0]?.toLowerCase() === 'confirm';
+    const ref = (confirm ? words.slice(1) : words).join(' ') || null;
     const loop = await this.findLoop(session, ref, l => l.phase === 'stopped');
     if (!loop || !loop.stop) return this.say(session, 'pr-loop：沒有停下等你決定的循環。');
+    if (loop.stop.resume && needsConsent(loop.stop) && !confirm) {
+      return this.say(
+        session,
+        [
+          `pr-loop：${loop.repo}#${loop.number} 停下的原因是 ${reasonsOf(loop.stop).map(r => REASON_TEXT[r]).join('、')}，接續需要你明確同意：`,
+          ...loop.stop.agree.map(a => `- ${a}`),
+          '',
+          `確認同意後執行 \`/pr-loop resume confirm${ref ? ` ${ref}` : ''}\`，或在停下時的卡片按「接續」。沒有接續任何東西。`,
+        ].join('\n'),
+        'warning',
+      );
+    }
     await this.resume(loop);
   }
 
@@ -577,20 +642,16 @@ export class PrLoop {
       return this.say(loop.implSession, `pr-loop：${loop.repo}#${loop.number} 停在「${REASON_TEXT[stop.reason]}」，不能接續；要重來請重新執行 /pr-loop ${loop.url}`);
     }
     const action = stop.resume;
-    this.note(loop, `使用者選擇接續：${RESUME_TEXT[action]}`);
+    this.note(loop, `使用者選擇接續：${RESUME_TEXT[action]}${stop.agree.length ? `（同意：${stop.agree.join('；')}）` : ''}`);
     // Back to the step it stopped at, so a failure while resuming records that step and the same way on
     loop.stop = null;
     loop.phase = stop.step;
     // A wait that ran out starts over
     loop.since = this.now();
-    // One more round only when this stop's card said so; any other resume that needs a round past the limit stops
-    // again at `max-rounds` (in `launchReview` or `sendFix`) and asks for exactly that
+    // Exactly what this stop named is agreed to: its holds by token, and one more round only when it said so. Anything
+    // else that holds is stopped on again by the next `gate`
+    loop.consents = [...new Set([...loop.consents, ...stop.consents])];
     if (stop.grantRound) loop.roundLimit = Math.max(loop.roundLimit, loop.round + 1);
-    if (stop.reason === 'conflict' || stop.also?.includes('conflict')) {
-      // The user accepts what the reviewer judged despite the conflicts it reported
-      const last = loop.rounds[loop.rounds.length - 1];
-      if (last?.result === 'conflict' && last.verdict) last.result = last.verdict;
-    }
     await this.save(loop, true);
     // Stopped around the merge: GitHub says whether it happened before anything else is done
     if (stop.step === 'merging') return this.guarded(loop, () => this.recoverMerge(loop), action);
@@ -650,12 +711,15 @@ export class PrLoop {
     const notes = section(pr.body, NOTES_TITLES);
     // `createdAt` tells a loop from an earlier one for the same PR: never the same value
     const now = Math.max(this.now(), (existing?.createdAt ?? 0) + 1);
+    // A loop stopped with `/pr-loop stop` for this PR: its rounds, round limit, consents and stop settings carry on, so
+    // stopping and starting again never resets what makes the loop stop (the round count, a repeated issue)
+    const prior = existing && existing.phase === 'cancelled' ? existing : null;
     const loop: Loop = {
       key,
       repo: pr.repo,
       number: pr.number,
       url: pr.url,
-      title: pr.title,
+      title: oneLine(pr.title),
       headRef: pr.headRefName,
       baseRef: pr.baseRefName,
       implSession: session,
@@ -665,18 +729,21 @@ export class PrLoop {
       requirementSource: source,
       notes,
       phase: 'launching',
-      round: 0,
-      roundLimit: MAX_ROUNDS,
-      reviewedSha: '',
+      round: prior?.round ?? 0,
+      roundLimit: prior?.roundLimit ?? MAX_ROUNDS,
+      reviewedSha: prior?.reviewedSha ?? '',
       reviewedBase: pr.baseRefName,
       baseSha: pr.headRefOid,
       reviewer: null,
-      rounds: [],
+      rounds: prior?.rounds ?? [],
       pendingFix: null,
       fixPending: false,
       fixSending: null,
       since: now,
-      lastCiFail: null,
+      policy: prior?.policy ?? { sameIssue: c.sameIssue },
+      consents: prior?.consents ?? [],
+      ciRuns: prior?.ciRuns ?? [],
+      fixFrom: null,
       noCiSince: null,
       stop: null,
       merge: null,
@@ -686,17 +753,23 @@ export class PrLoop {
       updatedAt: now,
       log: [],
     };
-    this.note(loop, `開始循環（需求原文來源：${SOURCE_TEXT[source]}${notes ? '' : '；PR 描述沒有「給 reviewer 的重點建議」'}）`);
+    this.note(loop, `開始循環（需求原文來源：${SOURCE_TEXT[source]}${notes ? '' : '；PR 描述沒有「給 reviewer 的重點建議」'}${prior ? `；接續先前停止的循環，沿用 ${prior.round} 輪紀錄` : ''}）`);
     await this.say(
       session,
       [
-        `pr-loop：開始 ${pr.repo}#${pr.number}「${pr.title}」的自動循環。`,
+        `pr-loop：開始 ${pr.repo}#${pr.number}「${loop.title}」的自動循環。`,
+        ...(prior
+          ? [
+              `- 這個 PR 先前的循環是用 \`/pr-loop stop\` 停止的：沿用它已做的 ${prior.round} 輪 review 紀錄、輪數上限 ${loop.roundLimit} 輪、你已同意過的項目與同一類問題的判定方式（${loop.policy.sameIssue}），輪數不會從 0 重新計算。`,
+            ]
+          : []),
         `- 需求原文來源：${SOURCE_TEXT[source]}${source === 'pr-body' ? '（這段是實作者自己寫在 PR 描述裡的，請確認它就是你的需求；不對就 `/pr-loop stop` 後附上需求原文重新開始）' : ''}`,
         `- 送給 reviewer 的需求原文：\n${quote(requirement)}`,
         `- 給 reviewer 的重點建議：${notes ? '已從 PR 描述取得' : 'PR 描述中沒有這一段'}`,
         `- reviewer agent：${c.reviewerAgent || `${info.agent}（與實作 session 相同）`}`,
         `- 合併方式：${c.merge === 'auto' ? '條件都滿足時自動合併（merge commit）' : '合併前出確認卡片（merge commit）'}`,
-        `- 最多 ${MAX_ROUNDS} 輪；用 \`/pr-loop status\` 查看、\`/pr-loop stop\` 停止。`,
+        `- 同一類問題的判定：${loop.policy.sameIssue}（這個循環固定用這個方式，之後改設定不影響它）`,
+        `- 最多 ${loop.roundLimit} 輪；用 \`/pr-loop status\` 查看、\`/pr-loop stop\` 停止。`,
       ].join('\n'),
     );
     await this.guarded(loop, () => this.launchReview(loop, pr), 'review');
@@ -718,22 +791,67 @@ export class PrLoop {
     } catch (e) {
       if (e instanceof Aborted) return;
       if (e instanceof GhError) {
-        return this.halt(loop, 'gh', `${e.message}\n\n先確認 \`gh auth status\` 已登入、網路正常。`, onError);
+        return this.halt(loop, 'gh', `gh 的訊息：\n${quote(e.message)}\n\n先確認 \`gh auth status\` 已登入、網路正常。`, onError);
       }
-      return this.halt(loop, 'error', (e as Error).stack ?? String(e), onError);
+      return this.halt(loop, 'error', quote((e as Error).stack ?? String(e)), onError);
     }
   }
 
-  // The loop stops for the user: where it is, what was done, and what resuming would do
-  // `also`: further reasons that hold at the same time, all named on the card. `grantRound`: the card says resuming
-  // goes past the round limit, so resuming grants one more round; no other stop's resume does
-  private async halt(loop: Loop, reason: StopReason, detail: string, resume: Resume | null, opts: { also?: StopReason[]; grantRound?: boolean } = {}): Promise<void> {
+  // Every hold `mustStop` finds before `transition`, all on one stop; true when there is none and the step may go on.
+  // `resume` is what resuming after the stop does (it runs the same step again, which asks again); `context` is shown
+  // after the reasons (the fix list waiting to go out, for one)
+  private async gate(loop: Loop, transition: Transition, resume: Resume, context = '', rewritten: { from: string; to: string; unknown?: string } | null = null): Promise<boolean> {
+    const holds = mustStop({
+      transition,
+      rounds: loop.rounds,
+      ciRuns: loop.ciRuns,
+      round: loop.round,
+      roundLimit: loop.roundLimit,
+      sameIssue: loop.policy.sameIssue,
+      fixFrom: loop.fixFrom,
+      consents: loop.consents,
+      rewritten,
+    });
+    if (!holds.length) return true;
+    const last = loop.rounds[loop.rounds.length - 1];
+    const details = holds.map(h => (h.reason === 'conflict' && last?.conflicts.length ? `${h.detail}\n\nreviewer 回報的衝突：\n${quote(last.conflicts.map(x => `- ${x}`).join('\n'))}` : h.detail));
+    await this.halt(loop, holds[0]!.reason, [...details, context].filter(Boolean).join('\n\n'), resume, {
+      also: holds.slice(1).map(h => h.reason),
+      consents: holds.flatMap(h => (h.token ? [h.token] : [])),
+      grantRound: holds.some(h => h.reason === 'max-rounds'),
+      agree: holds.map(h => h.agree),
+    });
+    return false;
+  }
+
+  // The loop stops for the user: where it is, what was done, and what resuming would do. `also`: further reasons that
+  // hold at the same time, all named. `consents`, `grantRound`, `agree`: what resuming from this stop lets through (only
+  // `gate` passes them), written on the card, in the toast and in `status`
+  private async halt(
+    loop: Loop,
+    reason: StopReason,
+    detail: string,
+    resume: Resume | null,
+    opts: { also?: StopReason[]; consents?: string[]; grantRound?: boolean; agree?: string[] } = {},
+  ): Promise<void> {
     const step: Phase = loop.phase === 'stopped' ? (loop.stop?.step ?? 'launching') : loop.phase;
-    const also = (opts.also ?? []).filter(r => r !== reason);
-    const grantRound = !!(resume && opts.grantRound);
-    loop.stop = { reason, step, detail, resume, at: this.now(), id: randomBytes(6).toString('hex'), also, grantRound };
+    const also = [...new Set((opts.also ?? []).filter(r => r !== reason))];
+    const stop: Stop = {
+      reason,
+      also,
+      step,
+      detail,
+      resume,
+      at: this.now(),
+      id: randomBytes(6).toString('hex'),
+      consents: resume ? [...(opts.consents ?? [])] : [],
+      grantRound: !!(resume && opts.grantRound),
+      agree: resume ? [...(opts.agree ?? [])] : [],
+    };
+    loop.stop = stop;
     loop.phase = 'stopped';
-    this.note(loop, `停下：${[reason, ...also].map(r => REASON_TEXT[r]).join('、')}`);
+    const reasons = reasonsOf(stop);
+    this.note(loop, `停下：${reasons.map(r => REASON_TEXT[r]).join('、')}`);
     try {
       await this.save(loop);
     } catch (e) {
@@ -742,8 +860,8 @@ export class PrLoop {
     }
     const done = loop.rounds.map(r => `第 ${r.round} 輪（${short(r.sha)}）：${ROUND_TEXT[r.result]}${r.blocking ? `，${r.blocking} 個 blocking` : ''}`);
     const message = [
-      `pr-loop：${loop.repo}#${loop.number} 停下來了 —— ${[reason, ...also].map(r => REASON_TEXT[r]).join('；')}。`,
-      ...(also.length ? ['', `同時成立的停止原因（${also.length + 1} 個）：`, ...[reason, ...also].map(r => `- ${REASON_TEXT[r]}`)] : []),
+      `pr-loop：${loop.repo}#${loop.number} 停下來了 —— ${reasons.map(r => REASON_TEXT[r]).join('；')}。`,
+      ...(reasons.length > 1 ? ['', `同時成立的停止原因（${reasons.length} 個）：`, ...reasons.map(r => `- ${REASON_TEXT[r]}`)] : []),
       '',
       `卡在：${PHASE_TEXT[step]}（第 ${loop.round} 輪，上限 ${loop.roundLimit} 輪）`,
       '',
@@ -753,11 +871,21 @@ export class PrLoop {
       ...(done.length ? done.map(d => `- ${d}`) : ['- 還沒有完成任何一輪 review']),
       '',
       '建議的選項：',
-      ...(resume ? [`- 接續：${RESUME_TEXT[resume]}（\`/pr-loop resume\`）${resumeConsent(loop, reason, also, grantRound)}`] : []),
+      ...(resume
+        ? [
+            `- 接續：${RESUME_TEXT[resume]}（按「接續」，或 \`/pr-loop resume${needsConsent(stop) ? ' confirm' : ''}\`）`,
+            ...(stop.agree.length ? ['  按接續代表你同意：', ...stop.agree.map(a => `  - ${a}`)] : []),
+          ]
+        : []),
       `- 停止循環（\`/pr-loop stop\`），自己處理`,
       `- 查看狀態（\`/pr-loop status\`）`,
     ].join('\n');
-    await this.host.toast(`pr-loop：${loop.repo}#${loop.number} 停下 —— ${REASON_TEXT[reason]}`, 'warning').catch(() => {});
+    await this.host
+      .toast(
+        `pr-loop：${loop.repo}#${loop.number} 停下 —— ${reasons.map(r => REASON_TEXT[r]).join('、')}${stop.agree.length ? `。接續代表同意：${stop.agree.join('；')}` : ''}`.slice(0, 480),
+        'warning',
+      )
+      .catch(() => {});
     // Every stop gets its own card: a card answers only the stop it describes, so an older one left open does nothing
     const options: AskOption[] = [...(resume ? [{ id: 'resume', label: '接續' }] : []), { id: 'stop', label: '停止循環' }, { id: 'later', label: '稍後決定' }];
     const createdAt = loop.createdAt;
@@ -903,9 +1031,18 @@ export class PrLoop {
     if (!pr) return;
     if (known && !acceptBase && !(await this.sameBase(loop, pr))) return;
     if (!(await this.implAlive(loop))) return;
-    if (loop.round >= loop.roundLimit) {
-      return this.halt(loop, 'max-rounds', `已經 review ${loop.round} 輪，再開下一輪會超過上限 ${loop.roundLimit} 輪。`, 'review', { grantRound: true });
+    // A head that moved since the last review must descend from the reviewed one: a rewritten history (a force push)
+    // is the user's to look at. GitHub not saying how the two relate counts as rewritten
+    let rewritten: { from: string; to: string; unknown?: string } | null = null;
+    if (loop.reviewedSha && pr.headRefOid !== loop.reviewedSha) {
+      try {
+        const status = await this.gh.compare(loop.repo, loop.reviewedSha, pr.headRefOid);
+        if (status !== 'ahead' && status !== 'identical') rewritten = { from: loop.reviewedSha, to: pr.headRefOid };
+      } catch (e) {
+        rewritten = { from: loop.reviewedSha, to: pr.headRefOid, unknown: oneLine((e as Error).message).slice(0, 300) };
+      }
     }
+    if (!(await this.gate(loop, 'review', 'review', '', rewritten))) return;
     const c = await this.config();
     const agent = c.reviewerAgent || loop.implAgent;
     loop.round += 1;
@@ -938,7 +1075,7 @@ export class PrLoop {
       this.host.send(id, text).catch(e =>
         this.exclusive(async () => {
           const now = await this.loop(key);
-          if (now && now.phase === 'reviewing' && now.reviewer?.session === id) await this.halt(now, 'reviewer-failed', `brief 沒有送進 reviewer session：${(e as Error).message}`, 'review');
+          if (now && now.phase === 'reviewing' && now.reviewer?.session === id) await this.halt(now, 'reviewer-failed', `brief 沒有送進 reviewer session：${oneLine((e as Error).message)}`, 'review');
         }),
       ),
       'reviewer brief',
@@ -977,61 +1114,49 @@ export class PrLoop {
     // A reply still streaming may not hold its block yet
     if (view.running) return waited > REVIEW_WAIT_MS ? stalled() : this.save(loop);
     const parsed = parseVerdict(reply.text, r.nonce);
-    const record = (result: Round['result'], keys: string[] = [], blocking = 0, verdict?: Round['verdict']) =>
-      loop.rounds.push({ round: loop.round, sha: loop.reviewedSha, base: loop.reviewedBase, reviewer: r.session, at: this.now(), result, keys, blocking, ...(verdict ? { verdict } : {}) });
+    // Only what the reviewer said is recorded; whether it stops the loop is `gate`'s to decide at the next step
+    const record = (result: Round['result'], v?: { issues: Issue[]; conflicts: string[]; verdict?: Round['verdict'] }) =>
+      loop.rounds.push({
+        round: loop.round,
+        sha: loop.reviewedSha,
+        base: loop.reviewedBase,
+        reviewer: r.session,
+        at: this.now(),
+        result,
+        issues: v?.issues ?? [],
+        conflicts: v?.conflicts ?? [],
+        blocking: v?.issues.length ?? 0,
+        ...(v?.verdict ? { verdict: v.verdict } : {}),
+      });
     // Every outcome below leaves `reviewing` in the same save as its record, so a round is never read twice
     const broke = reply.error || (reply.stop && reply.stop !== 'end_turn' ? `stop reason ${reply.stop}` : '');
     if (broke) {
       // A turn that ended in an error (cancelled, out of tokens …) may hold a block written before it broke off
       record('unparseable');
-      return this.halt(loop, 'reviewer-failed', `reviewer session \`${r.session}\` 這一輪沒有正常結束：${broke}。即使回覆裡有結論區塊也不採用。`, 'review');
+      return this.halt(loop, 'reviewer-failed', `reviewer session \`${r.session}\` 這一輪沒有正常結束：\n${quote(oneLine(broke), 600)}\n\n即使回覆裡有結論區塊也不採用。`, 'review');
     }
     if (!parsed.ok) {
       record('unparseable');
-      return this.halt(loop, 'unparseable', `reviewer session \`${r.session}\` 的回覆讀不到固定格式的結論：${parsed.error}${reply.error ? `\n\n這一輪的錯誤：${reply.error}` : ''}`, 'review');
+      return this.halt(loop, 'unparseable', `reviewer session \`${r.session}\` 的回覆讀不到固定格式的結論：\n${quote(oneLine(parsed.error), 600)}`, 'review');
     }
     const v = parsed.verdict;
-    const c = await this.config();
-    const keys = v.blocking.map(b => issueKey(b, c.sameIssue));
-    if (v.mergeable && !v.conflicts.length) {
-      record('mergeable');
-      this.note(loop, `第 ${loop.round} 輪 review 判定可合併`);
+    const issues = v.blocking.map(b => ({ category: b.category, file: b.file }));
+    if (v.mergeable) {
+      // A passing verdict goes on to CI; a conflict on it is stopped on by the `ci` gate there
+      record(v.conflicts.length ? 'conflict' : 'mergeable', { issues, conflicts: v.conflicts, ...(v.conflicts.length ? { verdict: 'mergeable' as const } : {}) });
+      this.note(loop, `第 ${loop.round} 輪 review 判定可合併${v.conflicts.length ? `，但回報 ${v.conflicts.length} 個衝突` : ''}`);
       loop.phase = 'waitingCi';
       loop.since = this.now();
       await this.save(loop);
       return this.waitingCi(loop);
     }
-    if (v.mergeable) {
-      // Conflicts on a passing verdict: nothing else to weigh, the next step is CI and the merge
-      record('conflict', keys, 0, 'mergeable');
-      loop.phase = 'waitingCi';
-      return this.halt(loop, 'conflict', `reviewer 回報需要你決定的衝突：\n${v.conflicts.map(x => `- ${x}`).join('\n')}\n\n它的判斷是「可合併」。接續就照這個判斷，進入 CI 與合併的檢查。`, 'ci');
-    }
-    // Not mergeable. Every reason to stop is weighed together, so one stop names them all and a resume agrees to no
-    // more than its card said
-    const previous = [...loop.rounds].reverse().find(x => verdictOf(x) !== null);
-    record(v.conflicts.length ? 'conflict' : 'not_mergeable', keys, v.blocking.length, v.conflicts.length ? 'not_mergeable' : undefined);
+    record(v.conflicts.length ? 'conflict' : 'not_mergeable', { issues, conflicts: v.conflicts, ...(v.conflicts.length ? { verdict: 'not_mergeable' as const } : {}) });
     loop.pendingFix = fixList(this.target(loop), loop.round, v);
     loop.fixPending = true;
+    loop.fixFrom = 'review';
     loop.phase = 'waitingFix';
-    this.note(loop, `第 ${loop.round} 輪 review 判定不可合併（${v.blocking.length} 個 blocking：${keys.join(', ')}）`);
+    this.note(loop, `第 ${loop.round} 輪 review 判定不可合併（${v.blocking.length} 個 blocking）`);
     await this.save(loop);
-    const reasons: { reason: StopReason; text: string }[] = [];
-    if (v.conflicts.length) {
-      reasons.push({ reason: 'conflict', text: `reviewer 回報需要你決定的衝突：\n${v.conflicts.map(x => `- ${x}`).join('\n')}\n\n它的判斷是「不可合併」，接續就照這個判斷送出修正清單。` });
-    }
-    const repeated = previous && verdictOf(previous) === 'not_mergeable' ? repeatedKeys(previous.keys, keys) : [];
-    if (repeated.length) {
-      reasons.push({ reason: 'repeated', text: `第 ${previous!.round} 輪與第 ${loop.round} 輪都退回同一類問題：${repeated.join('、')}（類別${c.sameIssue === 'category' ? '' : '＋檔案'}相同）。方向可能錯了，請先看過再決定。` });
-    }
-    const maxed = loop.round >= loop.roundLimit;
-    if (maxed) reasons.push({ reason: 'max-rounds', text: `第 ${loop.round} 輪仍判定不可合併，修正後的下一輪 review 會超過上限 ${loop.roundLimit} 輪。` });
-    if (reasons.length) {
-      return this.halt(loop, reasons[0]!.reason, `${reasons.map(x => x.text).join('\n\n')}\n\n這一輪的修正清單：\n\n${loop.pendingFix}`, 'fix', {
-        also: reasons.slice(1).map(x => x.reason),
-        grantRound: maxed,
-      });
-    }
     return this.sendFix(loop);
   }
 
@@ -1039,10 +1164,7 @@ export class PrLoop {
   private async sendFix(loop: Loop): Promise<void> {
     const text = loop.pendingFix;
     if (!text) return this.halt(loop, 'error', '沒有可送出的修正清單。', 'review');
-    // A fix needs another round of review: past the limit that is the user's call, asked here whatever led here
-    if (loop.round >= loop.roundLimit) {
-      return this.halt(loop, 'max-rounds', `已經 review ${loop.round} 輪（上限 ${loop.roundLimit} 輪），修正後的下一輪 review 會超過上限。\n\n待送出的修正清單：\n\n${text}`, 'fix', { grantRound: true });
-    }
+    if (!(await this.gate(loop, 'fix', 'fix', `待送出的修正清單：\n${quote(text, FIX_SHOWN)}`))) return;
     const pr = await this.openPr(loop, 'fix');
     if (!pr) return;
     if (!(await this.implAlive(loop))) return;
@@ -1083,7 +1205,7 @@ export class PrLoop {
             if (now && now.phase === 'waitingFix' && now.fixSending === sending) {
               now.fixSending = null;
               now.fixPending = true;
-              await this.halt(now, 'impl-closed', `修正清單沒有送進實作 session：${(e as Error).message}`, 'fix');
+              await this.halt(now, 'impl-closed', `修正清單沒有送進實作 session：${oneLine((e as Error).message)}`, 'fix');
             }
           }),
       ),
@@ -1116,7 +1238,13 @@ export class PrLoop {
     return this.save(loop);
   }
 
+  // The CI result for `sha`, one per head: a later result for the same head replaces the earlier one
+  private ciRun(loop: Loop, sha: string, failed: string[]): void {
+    loop.ciRuns = [...loop.ciRuns.filter(x => x.sha !== sha), { sha, failed }].slice(-20);
+  }
+
   private async waitingCi(loop: Loop): Promise<void> {
+    if (!(await this.gate(loop, 'ci', 'ci'))) return;
     const pr = await this.openPr(loop, 'ci');
     if (!pr) return;
     if (!(await this.implAlive(loop))) return;
@@ -1130,26 +1258,24 @@ export class PrLoop {
     if (ci.state === 'pending') {
       loop.phase = 'waitingCi';
       if (this.now() - loop.since > CI_WAIT_MS) {
-        return this.halt(loop, 'stalled', `CI 已經跑了 ${Math.round((this.now() - loop.since) / 60_000)} 分鐘還沒有結果（還在跑：${ci.pending.join('、') || '未知'}）。接續會再等 ${CI_WAIT_MS / 3_600_000} 小時。`, 'ci');
+        return this.halt(
+          loop,
+          'stalled',
+          `CI 已經跑了 ${Math.round((this.now() - loop.since) / 60_000)} 分鐘還沒有結果。還在跑的檢查：\n${quote(oneLine(ci.pending.join('、')) || '未知', 600)}\n\n接續會再等 ${CI_WAIT_MS / 3_600_000} 小時。`,
+          'ci',
+        );
       }
       return this.save(loop);
     }
     if (ci.state === 'fail') {
-      const names = ci.failed.map(f => `${f.workflow}/${f.name}`);
-      const repeated = loop.lastCiFail ? names.filter(n => loop.lastCiFail!.includes(n)) : [];
+      const names = ci.failed.map(f => oneLine(`${f.workflow}/${f.name}`));
+      this.ciRun(loop, pr.headRefOid, names);
       loop.pendingFix = ciFailure(this.target(loop, pr), ci.failed);
       loop.fixPending = true;
-      loop.lastCiFail = names;
+      loop.fixFrom = 'ci';
       loop.phase = 'waitingFix';
       this.note(loop, `CI 失敗：${names.join(', ')}`);
       await this.save(loop);
-      const reasons: { reason: StopReason; text: string }[] = [];
-      if (repeated.length) reasons.push({ reason: 'repeated', text: `CI 連續兩次在同樣的檢查失敗：${repeated.join('、')}。` });
-      const maxed = loop.round >= loop.roundLimit;
-      if (maxed) reasons.push({ reason: 'max-rounds', text: `CI 失敗，修正後需要的下一輪 review 會超過上限 ${loop.roundLimit} 輪。` });
-      if (reasons.length) {
-        return this.halt(loop, reasons[0]!.reason, `${reasons.map(x => x.text).join('\n\n')}\n\n${loop.pendingFix}`, 'fix', { also: reasons.slice(1).map(x => x.reason), grantRound: maxed });
-      }
       return this.sendFix(loop);
     }
     if (ci.state === 'none') {
@@ -1160,7 +1286,7 @@ export class PrLoop {
         return this.save(loop);
       }
     }
-    loop.lastCiFail = null;
+    this.ciRun(loop, pr.headRefOid, []);
     if (pr.isDraft) return this.halt(loop, 'draft', 'review 與 CI 都通過，但 PR 還是 draft。標成 ready for review 後接續。', 'ci');
     if (pr.mergeable === 'CONFLICTING') return this.halt(loop, 'merge-conflict', 'review 與 CI 都通過，但 PR 與目標分支有衝突，需要先解決（可請實作 session 處理後 push，接著會重新 review）。', 'ci');
     const c = await this.config();
@@ -1183,7 +1309,7 @@ export class PrLoop {
     const last = loop.rounds[loop.rounds.length - 1]!;
     const message = [
       `pr-loop：${loop.repo}#${loop.number}「${loop.title}」可以合併了。`,
-      `- 第 ${last.round} 輪獨立 review（reviewer session \`${last.reviewer}\`，commit \`${short(last.sha)}\`）的結論：${ROUND_TEXT[last.result]}，${last.blocking} 個 blocking`,
+      `- 第 ${last.round} 輪獨立 review（reviewer session \`${last.reviewer}\`，commit \`${short(last.sha)}\`）的結論：${ROUND_TEXT[effectiveResult(last, loop.consents)]}，${last.blocking} 個 blocking${last.result === 'conflict' ? `（reviewer 回報的 ${last.conflicts.length} 個衝突，你已同意照它的判斷處理）` : ''}`,
       `- ${ciText}`,
       `- 會用一般 merge commit 合併 \`${loop.headRef}\` → \`${last.base}\`（review 時的目標分支），只合併 review 過的 commit \`${short(last.sha)}\`；不 squash、不 rebase、不刪分支`,
       '',
@@ -1225,6 +1351,7 @@ export class PrLoop {
   // The merge, re-checked against GitHub first: the newest round passed for this very head, no failing or pending CI,
   // still allowed
   private async merge(loop: Loop, pr: PullRequest): Promise<void> {
+    if (!(await this.gate(loop, 'merge', 'ci'))) return;
     if (!(await this.sameBase(loop, pr))) return;
     if (!passed(loop, pr.headRefOid, pr.baseRefName)) {
       this.note(loop, `合併前發現 head ${short(pr.headRefOid)} 沒有最新一輪「可合併」的 review，重新 review`);
@@ -1260,7 +1387,14 @@ export class PrLoop {
     const after = await this.gh.pr(loop.number, loop.repo);
     if (after.state !== 'MERGED') {
       loop.phase = 'waitingCi';
-      return this.halt(loop, 'gh', failure ? `合併失敗：${failure}` : `合併指令回報成功，但 PR 的狀態是 ${after.state}。`, 'ci');
+      return this.halt(
+        loop,
+        'gh',
+        failure
+          ? `合併失敗：\n${quote(failure, 1200)}`
+          : `合併指令回報成功，但 PR 的狀態是 ${after.state}。如果這個 repo 用 merge queue，PR 可能只是排進了佇列：請到 PR 頁面確認，pr-loop 不會再合併一次。`,
+        'ci',
+      );
     }
     return this.finishMerge(loop, after);
   }
@@ -1277,12 +1411,20 @@ export class PrLoop {
     return this.halt(loop, 'interrupted', `合併這一步中途中斷了，PR 目前是 ${pr.state}，沒有被合併。不會自動再合併一次；接續會重新檢查 review 結論、CI 與合併條件。`, 'ci');
   }
 
+  // The PR is merged: recorded and reported. The report goes out whatever happens to the record — GitHub already merged
+  // it, so a failed or refused write (another engine, a cancel racing it) must not swallow which commit it was
   private async finishMerge(loop: Loop, pr: PullRequest): Promise<void> {
     loop.phase = 'merged';
     loop.merge = { commit: pr.mergeCommit, at: this.now() };
     loop.pendingFix = null;
     this.note(loop, `已合併，merge commit ${pr.mergeCommit ?? '（gh 沒有回報）'}`);
-    await this.save(loop);
+    let unsaved: string | null = null;
+    try {
+      await this.save(loop, false, true);
+    } catch (e) {
+      unsaved = (e as Error).message;
+      this.host.log(`${loop.key}: the merge could not be recorded: ${unsaved}`);
+    }
     await this.say(
       loop.implSession,
       [
@@ -1291,6 +1433,7 @@ export class PrLoop {
         `- 合併內容：\`${loop.headRef}\` 的 \`${short(loop.reviewedSha)}\` → \`${loop.baseRef}\`（一般 merge commit，分支保留）`,
         `- 經過 ${loop.round} 輪獨立 review；最後一輪判定可合併、沒有 blocking`,
         `- ${loop.url}`,
+        ...(unsaved ? [`- 注意：合併已完成，但 pr-loop 沒能把結果寫進自己的紀錄（${oneLine(unsaved)}），\`/pr-loop status\` 可能還顯示舊的狀態。`] : []),
       ].join('\n'),
     );
   }
@@ -1306,10 +1449,19 @@ export class PrLoop {
       .map(l =>
         [
           `**${l.repo}#${l.number}**「${l.title}」：${PHASE_TEXT[l.phase]}（第 ${l.round}/${l.roundLimit} 輪）`,
-          l.stop ? `- 停下原因：${REASON_TEXT[l.stop.reason]}（卡在：${PHASE_TEXT[l.stop.step]}）${l.stop.resume ? `；\`/pr-loop resume\` 會${RESUME_TEXT[l.stop.resume]}` : ''}` : '',
+          ...(l.stop
+            ? [
+                `- 停下原因：${reasonsOf(l.stop).map(r => REASON_TEXT[r]).join('、')}（卡在：${PHASE_TEXT[l.stop.step]}）`,
+                l.stop.resume ? `- 接續（\`/pr-loop resume${needsConsent(l.stop) ? ' confirm' : ''}\`）會${RESUME_TEXT[l.stop.resume]}` : '- 這次停下不能接續',
+                ...(l.stop.resume && l.stop.agree.length ? ['- 接續代表你同意：', ...l.stop.agree.map(a => `  - ${a}`)] : []),
+              ]
+            : []),
           l.reviewer ? `- 目前 reviewer session：\`${l.reviewer.session}\`（${l.reviewer.agent}）` : '',
-          `- 實作 session：\`${l.implSession}\`；需求原文來源：${SOURCE_TEXT[l.requirementSource]}`,
-          ...l.rounds.map(r => `- 第 ${r.round} 輪（${short(r.sha)}）：${ROUND_TEXT[r.result]}${r.keys.length ? `（${r.keys.join(', ')}）` : ''}`),
+          `- 實作 session：\`${l.implSession}\`；需求原文來源：${SOURCE_TEXT[l.requirementSource]}；同一類問題的判定：${l.policy.sameIssue}`,
+          ...l.rounds.map(r => {
+            const keys = issueKeyList(r.issues, l.policy.sameIssue);
+            return `- 第 ${r.round} 輪（${short(r.sha)}）：${ROUND_TEXT[r.result]}${keys.length ? `（${keys.join(', ')}）` : ''}`;
+          }),
           l.merge ? `- merge commit：\`${l.merge.commit ?? '?'}\`` : '',
           l.log.length ? `- 最近：${l.log[l.log.length - 1]}` : '',
         ]
@@ -1357,7 +1509,7 @@ export function configText(c: Config): string {
     `- reviewer agent：${c.reviewerAgent || '與實作 session 相同'}`,
     `- 合併：${c.merge === 'auto' ? 'auto（條件都滿足時自動合併）' : 'confirm（合併前出確認卡片）'}`,
     `- 輪詢間隔：${c.pollSecs} 秒`,
-    `- 同一類問題的判定：${c.sameIssue}`,
+    `- 同一類問題的判定：${c.sameIssue}（新開的循環在開始時取用並固定）`,
     `- gh 指令：${JSON.stringify(c.gh)}`,
   ].join('\n');
 }
@@ -1367,7 +1519,7 @@ export const HELP = [
   '- `/pr-loop <PR 編號或網址> [需求原文]`：開始自動循環（review → 修正 → CI → 合併）',
   '- `/pr-loop status [PR]`：查看狀態',
   '- `/pr-loop stop [PR]`：停止循環',
-  '- `/pr-loop resume [PR]`：接續停下的循環',
+  '- `/pr-loop resume [PR]`：接續停下的循環；停下原因需要你同意時（衝突、重複問題、超過輪數上限、歷史被改寫）要用 `/pr-loop resume confirm [PR]`',
   '- `/pr-loop config`：查看設定',
   '- `/pr-loop config allow <owner>/<repo>` / `disallow <owner>/<repo>`：允許清單（放寬限制的設定會先出確認卡片）',
   '- `/pr-loop config reviewer <agent id|same>`：reviewer 用的 agent',

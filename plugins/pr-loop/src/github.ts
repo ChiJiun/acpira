@@ -26,6 +26,8 @@ const NUMBER_ARG = /^\d+$/;
 const PR_REF = (a: string) => NUMBER_ARG.test(a) || parsePrUrl(a) !== null;
 const SHA_ARG = /^[0-9a-f]{7,64}$/i;
 const FIELDS_ARG = /^[a-zA-Z]+(,[a-zA-Z]+)*$/;
+const COMPARE_PATH = /^repos\/[\w.-]+\/[\w.-]+\/compare\/[0-9a-f]{7,64}\.\.\.[0-9a-f]{7,64}$/i;
+const HOST_ARG = /^[a-z0-9.-]+(:\d+)?$/i;
 
 type Slot = string | ((a: string) => boolean);
 const SHAPES: Slot[][] = [
@@ -34,6 +36,9 @@ const SHAPES: Slot[][] = [
   ['pr', 'view', PR_REF, '--repo', a => REPO_ARG.test(a), '--json', a => FIELDS_ARG.test(a)],
   ['pr', 'checks', a => NUMBER_ARG.test(a), '--repo', a => REPO_ARG.test(a), '--json', a => FIELDS_ARG.test(a)],
   ['pr', 'merge', a => NUMBER_ARG.test(a), '--repo', a => REPO_ARG.test(a), '--merge', '--match-head-commit', a => SHA_ARG.test(a)],
+  // A read of how two commits relate (`gh api` without a method flag or fields is a GET)
+  ['api', a => COMPARE_PATH.test(a), '--jq', '.status'],
+  ['api', a => COMPARE_PATH.test(a), '--hostname', a => HOST_ARG.test(a), '--jq', '.status'],
 ];
 
 export function guardArgs(args: string[]): void {
@@ -105,11 +110,14 @@ export class GitHub {
     const where = parsePrUrl(url);
     if (!where) throw new GhError(`gh pr view answered an unexpected url: ${url}`, args, r);
     const commit = raw.mergeCommit as { oid?: string } | null | undefined;
+    // A state gh did not give is a failed read, never taken for "open"
+    const state = String(raw.state ?? '').toUpperCase();
+    if (state !== 'OPEN' && state !== 'CLOSED' && state !== 'MERGED') throw new GhError(`gh pr view answered no known state: ${JSON.stringify(raw.state ?? null)}`, args, r);
     return {
       number: Number(raw.number),
       url,
       repo: where.repo,
-      state: (String(raw.state ?? '').toUpperCase() as PullRequest['state']) || 'OPEN',
+      state,
       isDraft: raw.isDraft === true,
       title: String(raw.title ?? ''),
       body: String(raw.body ?? ''),
@@ -164,6 +172,23 @@ export class GitHub {
     const pending = checks.filter(c => bucket(c) !== 'pass' && bucket(c) !== 'skipping');
     if (pending.length) return { state: 'pending', pending: pending.map(c => String(c.name ?? '')) };
     return { state: 'pass' };
+  }
+
+  // How `head` relates to `base` in `repo`: `ahead` or `identical` when head descends from base, `behind` or
+  // `diverged` when it does not (history rewritten). Anything else, a failure included, is a GhError
+  compareArgs(repo: string, base: string, head: string): string[] {
+    const parts = repo.split('/');
+    const host = parts.length === 3 ? parts[0]! : null;
+    const path = `repos/${parts.slice(-2).join('/')}/compare/${base}...${head}`;
+    return ['api', path, ...(host ? ['--hostname', host] : []), '--jq', '.status'];
+  }
+
+  async compare(repo: string, base: string, head: string): Promise<'ahead' | 'identical' | 'behind' | 'diverged'> {
+    const args = this.compareArgs(repo, base, head);
+    const r = await this.call(args);
+    const status = r.stdout.trim();
+    if (status === 'ahead' || status === 'identical' || status === 'behind' || status === 'diverged') return status;
+    throw new GhError(`gh api compare answered an unknown status: ${JSON.stringify(status.slice(0, 80))}`, args, r);
   }
 
   // The one merge: a merge commit of exactly the reviewed head. No `--auto`, `--squash`, `--rebase`, no branch deletion

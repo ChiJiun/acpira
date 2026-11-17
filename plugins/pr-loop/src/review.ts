@@ -110,7 +110,8 @@ export function parseVerdict(reply: string, nonce: string): ParseResult {
     }
     const summary = str(b.summary);
     if (!summary) return { ok: false, error: `blocking[${i}].summary is empty` };
-    blocking.push({ category, file: str(b.file), summary, detail: str(b.detail), fix: str(b.fix) });
+    // `file` and the conflicts are shown on the user's cards: one line each, so they cannot pass for the card's own text
+    blocking.push({ category, file: oneLine(str(b.file)), summary, detail: str(b.detail), fix: str(b.fix) });
   }
   const suggestionsRaw = list('suggestions');
   if (typeof suggestionsRaw === 'string') return { ok: false, error: suggestionsRaw };
@@ -126,7 +127,7 @@ export function parseVerdict(reply: string, nonce: string): ParseResult {
   });
   const conflictsRaw = list('conflicts');
   if (typeof conflictsRaw === 'string') return { ok: false, error: conflictsRaw };
-  const conflicts = conflictsRaw.map(c => str(c)).filter(Boolean);
+  const conflicts = conflictsRaw.map(c => oneLine(str(c))).filter(Boolean);
   const mergeable = verdict === 'mergeable';
   // A verdict that disagrees with its own list is not read either way
   if (mergeable && blocking.length > 0) return { ok: false, error: 'the verdict is "mergeable" but `blocking` is not empty' };
@@ -139,7 +140,7 @@ export function parseVerdict(reply: string, nonce: string): ParseResult {
 export type SameIssue = 'category+file' | 'category';
 
 // What makes two blocking items "the same kind of issue": the fixed category, and by default the file too
-export function issueKey(item: Pick<BlockingItem, 'category' | 'file'>, mode: SameIssue = 'category+file'): string {
+export function issueKey(item: { category: string; file: string }, mode: SameIssue = 'category+file'): string {
   if (mode === 'category') return item.category;
   const file = item.file.replace(/\\/g, '/').replace(/^\.\//, '').replace(/:\d+(-\d+)?$/, '').toLowerCase();
   return `${item.category}|${file || '*'}`;
@@ -215,7 +216,10 @@ export function brief(pr: PrTarget, requirement: string, notes: string | null, n
   ].join('\n');
 }
 
-const line = (s: string) => s.replace(/\s+/g, ' ').trim();
+// Text from a reviewer, a PR or gh as one line: on a card it cannot start a line of its own (a heading, a list item, a
+// "建議的選項" of its own)
+export const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();
+const line = oneLine;
 
 // The fix list sent back to the implementing session
 export function fixList(pr: PrTarget, round: number, v: Verdict): string {
